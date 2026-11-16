@@ -10,7 +10,8 @@ from typing import Protocol
 
 from fastembed import TextEmbedding
 
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+from context_server.config import EMBEDDING_MODEL
+
 EMBEDDING_DIMENSIONS = 384
 MAX_EMBEDDING_BATCH_SIZE = 256
 
@@ -24,8 +25,9 @@ class Embedder(Protocol):
 
 
 class FastEmbedder:
-    def __init__(self, cache_dir: Path | None = None) -> None:
+    def __init__(self, cache_dir: Path | None = None, model_name: str = EMBEDDING_MODEL) -> None:
         self._cache_dir = cache_dir
+        self._model_name = model_name
         self._model: TextEmbedding | None = None
         self._lock = Lock()
 
@@ -63,7 +65,7 @@ class FastEmbedder:
             if os.name == "posix":
                 os.chmod(self._cache_dir, 0o700)
         self._model = TextEmbedding(
-            model_name=EMBEDDING_MODEL,
+            model_name=self._model_name,
             cache_dir=str(self._cache_dir) if self._cache_dir is not None else None,
             threads=2,
         )

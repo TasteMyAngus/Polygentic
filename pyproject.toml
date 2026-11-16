@@ -30,6 +30,7 @@ context-session-state = "context_server.client_state:main"
 context-evaluate-retrieval = "context_server.evaluation:main"
 context-backup = "context_server.backup:backup_main"
 context-restore = "context_server.backup:restore_main"
+context-reindex = "context_server.reindex:reindex_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context_server"]

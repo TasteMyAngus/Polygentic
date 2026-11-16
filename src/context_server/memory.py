@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from context_server.config import EMBEDDING_MODEL
 from context_server.embeddings import Embedder
 from context_server.storage import (
     CheckpointSnapshot,
@@ -187,9 +188,15 @@ class ContextAssembly(BaseModel):
 
 
 class MemoryService:
-    def __init__(self, database: MemoryDatabase, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        database: MemoryDatabase,
+        embedder: Embedder,
+        embedding_model: str = EMBEDDING_MODEL,
+    ) -> None:
         self._database = database
         self._embedder = embedder
+        self._embedding_model = embedding_model
 
     async def register_session(
         self, provider: str, label: str, idempotency_key: str
@@ -413,6 +420,7 @@ class MemoryService:
             source_ref=source_ref,
             chunks=chunks,
             vectors=vectors,
+            embedding_model=self._embedding_model,
         )
         return _write_result(receipt, resolved_space_id)
 
@@ -569,6 +577,7 @@ class MemoryService:
             metadata_json=metadata_json,
             chunks=chunks,
             vectors=vectors,
+            embedding_model=self._embedding_model,
         )
         return _checkpoint_result(receipt)
 

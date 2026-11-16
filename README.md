@@ -10,8 +10,9 @@ The initial persistent-memory slice is implemented: authenticated logical sessio
 revisioned text records, local embeddings, hybrid retrieval, typed task checkpoints, and
 bounded context assembly. The real embedding model has passed a local retrieval smoke test;
 an automated MCP client recovered local state across a real server-process restart.
-Client-specific integration still needs validation. Shared/project spaces and production
-deployment are not implemented.
+Exact-session shared/project spaces and SQLite backup/restore are also implemented.
+Client-specific recovery and production deployment still need validation; see the
+[macOS LaunchAgent guide](docs/macos-launchd.md) for a local service template and its limits.
 
 The user provisionally accepted Gate 0 for proceeding on 2026-11-16, with the
 client-compatibility gaps documented below; this is not approval for public exposure or
@@ -136,9 +137,22 @@ SQLite stores records, FTS5 indexes, and sqlite-vec vectors locally. The first m
 or semantic/hybrid search initializes FastEmbed and may download `BAAI/bge-small-en-v1.5`;
 afterward inference is local. Defaults use the operating system's Polygentic application
 data/cache directories. Override them with `CONTEXT_SERVER_DATA_DIR` and
-`CONTEXT_SERVER_MODEL_CACHE_DIR`. Data and model caches are intended to remain private to
-the service account. Retrieved context is still sent to the connected provider when used;
-local embeddings do not mean retrieved text stays on the Mac.
+`CONTEXT_SERVER_MODEL_CACHE_DIR`; select a 384-dimensional model with
+`CONTEXT_SERVER_EMBEDDING_MODEL` (default `BAAI/bge-small-en-v1.5`). Stored chunk vectors
+record their model identity, and the server refuses to start if the configured model does
+not match existing vectors.
+
+To change models, stop all server processes, build a validated reindexed database file with
+`context-reindex /path/to/reindexed.sqlite3 --model-name MODEL_ID` (replace `MODEL_ID` with
+the target model name), update
+`CONTEXT_SERVER_EMBEDDING_MODEL` in the server configuration, then install the reindexed
+database with `context-restore /path/to/reindexed.sqlite3 --overwrite` (add `--data-dir`
+when using a non-default directory). Reindexing never edits the live database; restore
+atomically replaces it after validation. The reindex command accepts `--data-dir` and
+`--model-cache-dir` for non-default paths, and its output is owner-only. The target model
+must also produce 384-dimensional vectors. Data and model caches are intended to remain
+private to the service account. Retrieved context is still sent to the connected provider
+when used; local embeddings do not mean retrieved text stays on the Mac.
 
 Create an owner-only, SQLite-consistent backup with `context-backup /path/to/backup.sqlite3`.
 The command uses the configured `CONTEXT_SERVER_DATA_DIR` (or the default application data
@@ -255,8 +269,11 @@ The route was reset and the server stopped after the test; no public server is c
 exposed. On 2026-11-16, the user accepted Gate 0 provisionally for continued development.
 This records a scope decision, not a pass for the unverified Codex desktop client or
 deferred GitHub Copilot cloud agent. Production Mac mini deployment, upstream GitHub grant
-revocation, production state/key recovery, launchd recovery, and persistent external
-operation remain unverified. The local process-restart check used only synthetic data and
-stopped before OAuth approval or any upstream GitHub request. Request-size and process-wide
-rate limits are implemented, but they are not a substitute for upstream DDoS protection.
-Do not enable persistent public access until the remaining deployment checks pass.
+revocation, production state/key recovery, production launchd recovery, and persistent
+external operation remain unverified. An isolated local LaunchAgent test authenticated
+MCP `whoami` and verified automatic restart on loopback with temporary credentials; the
+test job was unloaded afterward. The local process-restart check used only synthetic data
+and stopped before OAuth approval or any upstream GitHub request. Request-size and
+process-wide rate limits are implemented, but they are not a substitute for upstream DDoS
+protection. Do not enable persistent public access until the remaining deployment checks
+pass.

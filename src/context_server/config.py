@@ -15,6 +15,7 @@ _PROVIDER_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 _SHA256 = re.compile(r"^[a-fA-F0-9]{64}$")
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _MAX_CREDENTIAL_FILE_BYTES = 64 * 1024
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class ConfigurationError(ValueError):
@@ -46,6 +47,7 @@ class Settings:
     local_github_oauth: LocalGitHubOAuth | None = None
     data_dir: Path | None = None
     model_cache_dir: Path | None = None
+    embedding_model: str = EMBEDDING_MODEL
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -90,6 +92,9 @@ class Settings:
                 str(user_cache_path("Polygentic", appauthor=False) / "models"),
             )
         ).expanduser()
+        embedding_model = os.environ.get("CONTEXT_SERVER_EMBEDDING_MODEL", EMBEDDING_MODEL)
+        if not embedding_model.strip() or len(embedding_model) > 256:
+            raise ConfigurationError("CONTEXT_SERVER_EMBEDDING_MODEL must be 1-256 characters")
 
         return cls(
             credentials=credentials,
@@ -100,6 +105,7 @@ class Settings:
             local_github_oauth=oauth,
             data_dir=data_dir,
             model_cache_dir=model_cache_dir,
+            embedding_model=embedding_model,
         )
 
 

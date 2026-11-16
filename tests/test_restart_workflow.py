@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import socket
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
@@ -47,6 +50,51 @@ def _start_server(
     )
 
 
+def _start_configured_server(
+    credentials_file: Path, data_dir: Path, model_cache_dir: Path, port: int
+) -> subprocess.Popen[str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("CONTEXT_SERVER_")
+    }
+    environment.update(
+        {
+            "CONTEXT_SERVER_CREDENTIALS_FILE": str(credentials_file),
+            "CONTEXT_SERVER_DATA_DIR": str(data_dir),
+            "CONTEXT_SERVER_MODEL_CACHE_DIR": str(model_cache_dir),
+            "CONTEXT_SERVER_PORT": str(port),
+        }
+    )
+    return subprocess.Popen(
+        [sys.executable, "-m", "context_server.server"],
+        cwd=_REPOSITORY_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def _write_provider_credentials(path: Path, tokens: tuple[str, ...]) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credentials": [
+                    {
+                        "provider": "codex",
+                        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                    }
+                    for token in tokens
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
 def _wait_for_server(process: subprocess.Popen[str], port: int) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -74,6 +122,37 @@ def _stop_server(process: subprocess.Popen[str]) -> None:
 def _structured(result: Any) -> dict[str, Any]:
     assert result.structured_content is not None
     return result.structured_content
+
+
+async def _authenticated_provider(endpoint: str, token: str) -> str:
+    async with Client(StreamableHttpTransport(endpoint, auth=token)) as client:
+        provider = _structured(await client.call_tool("whoami", {})).get("provider")
+        if not isinstance(provider, str):
+            raise TypeError("MCP whoami did not return a provider")
+        return provider
+
+
+async def _is_unauthorized(endpoint: str, token: str) -> bool:
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "credential-lifecycle-test", "version": "1"},
+        },
+    }
+    async with httpx.AsyncClient(timeout=5) as client:
+        response = await client.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, text/event-stream",
+            },
+            json=request,
+        )
+    return response.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -183,6 +262,43 @@ async def test_local_session_state_recovers_after_real_server_restart(
             restored_assembly = _structured(assembly)
             assert restored_assembly["checkpoint"]["head_revision"] == 1
             assert restored_assembly["evidence"][0]["document_id"] == document_id
+    finally:
+        for process in processes:
+            _stop_server(process)
+
+
+@pytest.mark.asyncio
+async def test_credential_rotation_and_revocation_after_restart(
+    tmp_path: Path,
+) -> None:
+    old_token = "old-credential-rotation-test-token"
+    new_token = "new-credential-rotation-test-token"
+    credentials_file = tmp_path / "credentials.json"
+    data_dir = tmp_path / "server-data"
+    model_cache_dir = tmp_path / "model-cache"
+    port = _unused_port()
+    endpoint = f"http://127.0.0.1:{port}/mcp"
+    processes: list[subprocess.Popen[str]] = []
+
+    try:
+        _write_provider_credentials(credentials_file, (old_token,))
+        first = _start_configured_server(
+            credentials_file, data_dir, model_cache_dir, port
+        )
+        processes.append(first)
+        _wait_for_server(first, port)
+        assert await _authenticated_provider(endpoint, old_token) == "codex"
+        assert await _is_unauthorized(endpoint, new_token)
+        _stop_server(first)
+
+        _write_provider_credentials(credentials_file, (new_token,))
+        rotated = _start_configured_server(
+            credentials_file, data_dir, model_cache_dir, port
+        )
+        processes.append(rotated)
+        _wait_for_server(rotated, port)
+        assert await _authenticated_provider(endpoint, new_token) == "codex"
+        assert await _is_unauthorized(endpoint, old_token)
     finally:
         for process in processes:
             _stop_server(process)

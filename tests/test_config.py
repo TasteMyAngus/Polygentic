@@ -43,11 +43,13 @@ def test_settings_load_persistent_memory_paths(
     monkeypatch.setenv("CONTEXT_SERVER_CREDENTIALS_FILE", str(credentials))
     monkeypatch.setenv("CONTEXT_SERVER_DATA_DIR", str(data_dir))
     monkeypatch.setenv("CONTEXT_SERVER_MODEL_CACHE_DIR", str(model_cache_dir))
+    monkeypatch.setenv("CONTEXT_SERVER_EMBEDDING_MODEL", "test/custom-embedding")
 
     settings = Settings.from_environment()
 
     assert settings.data_dir == data_dir
     assert settings.model_cache_dir == model_cache_dir
+    assert settings.embedding_model == "test/custom-embedding"
 
 
 @pytest.mark.parametrize(

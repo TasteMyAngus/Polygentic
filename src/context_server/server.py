@@ -32,7 +32,7 @@ from context_server.memory import (
     SupersessionResult,
 )
 from context_server.middleware import RequestBoundaryMiddleware
-from context_server.storage import MemoryDatabase
+from context_server.storage import MemoryDatabase, MemoryStorageError
 
 MAX_ECHO_CHARACTERS = 2048
 
@@ -54,9 +54,16 @@ def create_app(
             client_storage=oauth_client_storage,
         )
     database = memory_database or MemoryDatabase(settings.data_dir)
+    try:
+        database.validate_embedding_model(settings.embedding_model)
+    except MemoryStorageError:
+        if memory_database is None:
+            database.close()
+        raise
     memory = MemoryService(
         database,
-        embedder or FastEmbedder(settings.model_cache_dir),
+        embedder or FastEmbedder(settings.model_cache_dir, settings.embedding_model),
+        settings.embedding_model,
     )
     mcp = FastMCP(name="Context Server", auth=verifier)
     read_only = ToolAnnotations(

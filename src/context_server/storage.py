@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -215,6 +216,98 @@ class MemoryDatabase:
                 self._connection.close()
                 self._closed = True
 
+    def validate_embedding_model(self, model_name: str) -> None:
+        if not model_name.strip():
+            raise MemoryStorageError("Embedding model name cannot be empty")
+        with self._lock:
+            self._ensure_open()
+            stored_models = tuple(
+                row[0]
+                for row in self._connection.execute(
+                    "SELECT DISTINCT model_name FROM chunks ORDER BY model_name"
+                )
+            )
+        if len(stored_models) > 1:
+            raise MemoryStorageError(
+                "Memory database contains mixed embedding models; run context-reindex"
+            )
+        if stored_models and stored_models[0] != model_name:
+            raise MemoryStorageError(
+                f"Memory database uses embedding model '{stored_models[0]}', not "
+                f"'{model_name}'; run context-reindex before starting the server"
+            )
+
+    def chunks_for_reindex(self) -> list[tuple[int, str]]:
+        with self._lock:
+            self._ensure_open()
+            rows = self._connection.execute(
+                "SELECT id, chunk_text FROM chunks ORDER BY id"
+            ).fetchall()
+            return [(int(row["id"]), str(row["chunk_text"])) for row in rows]
+
+    def replace_chunk_embeddings(
+        self,
+        embeddings: Sequence[tuple[int, Sequence[float]]],
+        model_name: str,
+    ) -> None:
+        if not model_name.strip():
+            raise MemoryStorageError("Embedding model name cannot be empty")
+        chunk_ids = tuple(chunk_id for chunk_id, _ in embeddings)
+        if len(set(chunk_ids)) != len(chunk_ids):
+            raise MemoryStorageError("Reindex result contains duplicate chunk identifiers")
+        for _, vector in embeddings:
+            if len(vector) != EMBEDDING_DIMENSIONS or not all(
+                math.isfinite(value) for value in vector
+            ):
+                raise MemoryStorageError("Reindex produced an incompatible embedding vector")
+
+        with self._transaction() as connection:
+            stored_ids = tuple(
+                int(row["id"]) for row in connection.execute("SELECT id FROM chunks ORDER BY id")
+            )
+            if stored_ids != tuple(sorted(chunk_ids)):
+                raise MemoryConflictError(
+                    "Chunk set changed during reindex; stop the server and retry"
+                )
+            connection.execute("DELETE FROM chunk_vectors")
+            for chunk_id, vector in embeddings:
+                connection.execute(
+                    "INSERT INTO chunk_vectors(rowid, embedding) VALUES (?, ?)",
+                    (chunk_id, sqlite_vec.serialize_float32(vector)),
+                )
+            connection.execute("UPDATE chunks SET model_name = ?", (model_name,))
+            vector_count = int(
+                connection.execute("SELECT count(*) FROM chunk_vectors").fetchone()[0]
+            )
+            if vector_count != len(stored_ids):
+                raise MemoryStorageError("Reindex did not rebuild every chunk embedding")
+
+    @classmethod
+    def require_stopped(cls, data_dir: Path) -> None:
+        database_path = data_dir / "context.sqlite3"
+        if not database_path.exists():
+            return
+        try:
+            current = sqlite3.connect(database_path)
+            try:
+                checkpoint = current.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is None or checkpoint[0] != 0:
+                    raise MemoryConflictError(
+                        "Unable to checkpoint database; stop all server processes"
+                    )
+            finally:
+                current.close()
+        except sqlite3.Error as exc:
+            raise MemoryStorageError(
+                "Unable to prepare database; stop all server processes"
+            ) from exc
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{database_path}{suffix}")
+            if sidecar.is_symlink():
+                raise MemoryStorageError("Database sidecars must not be symbolic links")
+            if sidecar.exists():
+                raise MemoryConflictError("Database sidecars remain; stop all server processes")
+
     def backup_to(self, destination: Path, *, overwrite: bool = False) -> Path:
         if self._database_path is None:
             raise MemoryStorageError("An in-memory database cannot be backed up to a file")
@@ -387,32 +480,7 @@ class MemoryDatabase:
                 finally:
                     staged.close()
 
-                if database_path.exists():
-                    try:
-                        current = sqlite3.connect(database_path)
-                        try:
-                            checkpoint = current.execute(
-                                "PRAGMA wal_checkpoint(TRUNCATE)"
-                            ).fetchone()
-                            if checkpoint is None or checkpoint[0] != 0:
-                                raise MemoryConflictError(
-                                    "Unable to checkpoint destination; stop the server before restore"
-                                )
-                        finally:
-                            current.close()
-                    except sqlite3.Error as exc:
-                        raise MemoryStorageError(
-                            "Unable to prepare destination database; stop the server before restore"
-                        ) from exc
-
-                for suffix in ("-wal", "-shm"):
-                    sidecar = Path(f"{database_path}{suffix}")
-                    if sidecar.is_symlink():
-                        raise MemoryStorageError("Database sidecars must not be symbolic links")
-                    if sidecar.exists():
-                        raise MemoryConflictError(
-                            "Database sidecars remain; stop all server processes before restore"
-                        )
+                cls.require_stopped(data_dir)
                 os.replace(ready_path, database_path)
                 os.chmod(database_path, 0o600)
                 if os.name == "posix":
@@ -1443,6 +1511,7 @@ class MemoryDatabase:
         source_ref: str | None,
         chunks: Sequence[ChunkInput],
         vectors: Sequence[Sequence[float]],
+        embedding_model: str,
     ) -> WriteReceipt:
         with self._transaction() as connection:
             session = self._get_session(connection, provider, session_id)
@@ -1496,6 +1565,7 @@ class MemoryDatabase:
                 task_id=None,
                 chunks=chunks,
                 vectors=vectors,
+                embedding_model=embedding_model,
                 created_at=now,
             )
             connection.execute(
@@ -1564,6 +1634,7 @@ class MemoryDatabase:
         metadata_json: str,
         chunks: Sequence[ChunkInput],
         vectors: Sequence[Sequence[float]],
+        embedding_model: str,
     ) -> WriteReceipt:
         with self._transaction() as connection:
             session = self._get_session(connection, provider, session_id)
@@ -1600,6 +1671,7 @@ class MemoryDatabase:
                 task_id=task_id,
                 chunks=chunks,
                 vectors=vectors,
+                embedding_model=embedding_model,
                 created_at=now,
             )
             head_revision = actual_revision + 1
@@ -1830,10 +1902,13 @@ class MemoryDatabase:
         task_id: str | None,
         chunks: Sequence[ChunkInput],
         vectors: Sequence[Sequence[float]],
+        embedding_model: str,
         created_at: str,
     ) -> None:
         if len(chunks) != len(vectors) or not chunks:
             raise MemoryStorageError("Every stored chunk must have exactly one embedding")
+        if not embedding_model.strip():
+            raise MemoryStorageError("Embedding model name cannot be empty")
         connection.execute(
             """
             INSERT INTO document_revisions(
@@ -1871,7 +1946,7 @@ class MemoryDatabase:
                     chunk.char_end,
                     chunk.text,
                     chunk.content_hash,
-                    "BAAI/bge-small-en-v1.5",
+                    embedding_model,
                 ),
             )
             if cursor.lastrowid is None:

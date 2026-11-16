@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polygentic.context-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__INSTALL_ROOT__/.venv/bin/context-server</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__INSTALL_ROOT__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CONTEXT_SERVER_CREDENTIALS_FILE</key>
+        <string>__ACCOUNT_HOME__/.config/polygentic/credentials.json</string>
+        <key>CONTEXT_SERVER_DATA_DIR</key>
+        <string>__ACCOUNT_HOME__/Library/Application Support/Polygentic</string>
+        <key>CONTEXT_SERVER_MODEL_CACHE_DIR</key>
+        <string>__ACCOUNT_HOME__/Library/Caches/Polygentic/models</string>
+        <key>CONTEXT_SERVER_EMBEDDING_MODEL</key>
+        <string>BAAI/bge-small-en-v1.5</string>
+        <key>CONTEXT_SERVER_HOST</key>
+        <string>127.0.0.1</string>
+        <key>CONTEXT_SERVER_PORT</key>
+        <string>8000</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__ACCOUNT_HOME__/Library/Logs/Polygentic/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>__ACCOUNT_HOME__/Library/Logs/Polygentic/server-error.log</string>
+</dict>
+</plist>

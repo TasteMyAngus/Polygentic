@@ -7,7 +7,7 @@ import sqlite3
 import stat
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -18,7 +18,7 @@ import sqlite_vec  # type: ignore[import-untyped]
 
 from context_server.embeddings import EMBEDDING_DIMENSIONS
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_TOP_K = 50
 
 
@@ -58,6 +58,12 @@ class WriteReceipt:
 
 
 @dataclass(frozen=True)
+class SupersessionReceipt:
+    newer_document_id: str
+    superseded_document_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ChunkInput:
     text: str
     char_start: int
@@ -79,6 +85,9 @@ class RecordSnapshot:
     author_session_id: str
     created_at: str
     task_id: str | None
+    status: str
+    supersedes: tuple[str, ...] = ()
+    superseded_by: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,6 +112,9 @@ class SearchCandidate:
     char_start: int
     char_end: int
     metric: float
+    status: str
+    supersedes: tuple[str, ...]
+    superseded_by: tuple[str, ...]
 
 
 class MemoryDatabase:
@@ -190,6 +202,9 @@ class MemoryDatabase:
                 f"schema {_SCHEMA_VERSION}"
             )
         if current_version == _SCHEMA_VERSION:
+            return
+        if current_version == 1:
+            self._migrate_v1_to_v2()
             return
         self._connection.executescript(
             """
@@ -292,6 +307,50 @@ class MemoryDatabase:
                     REFERENCES document_revisions(document_id, revision)
             );
             PRAGMA user_version = 1;
+            COMMIT;
+            """
+        )
+        self._migrate_v1_to_v2()
+
+    def _migrate_v1_to_v2(self) -> None:
+        self._connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS supersession_edges (
+                newer_document_id TEXT NOT NULL REFERENCES documents(id),
+                older_document_id TEXT NOT NULL REFERENCES documents(id),
+                created_by_provider TEXT NOT NULL,
+                created_by_session_id TEXT NOT NULL REFERENCES sessions(id),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(newer_document_id, older_document_id),
+                CHECK (newer_document_id <> older_document_id)
+            );
+            CREATE INDEX IF NOT EXISTS supersession_edges_by_older
+                ON supersession_edges(older_document_id, newer_document_id);
+
+            CREATE TABLE IF NOT EXISTS document_status_events (
+                id INTEGER PRIMARY KEY,
+                document_id TEXT NOT NULL REFERENCES documents(id),
+                content_revision INTEGER NOT NULL,
+                prior_status TEXT NOT NULL CHECK (prior_status IN ('active', 'superseded')),
+                new_status TEXT NOT NULL CHECK (new_status IN ('superseded', 'deleted')),
+                actor_provider TEXT NOT NULL,
+                actor_session_id TEXT NOT NULL REFERENCES sessions(id),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS document_status_events_by_document
+                ON document_status_events(document_id, id);
+
+            CREATE TABLE IF NOT EXISTS supersession_requests (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                idempotency_key TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id, idempotency_key)
+            );
+            PRAGMA user_version = 2;
             COMMIT;
             """
         )
@@ -456,6 +515,15 @@ class MemoryDatabase:
             """,
             (provider, session_id, idempotency_key),
         ).fetchone()
+        supersession_request = connection.execute(
+            """
+            SELECT 1 FROM supersession_requests
+            WHERE provider = ? AND session_id = ? AND idempotency_key = ?
+            """,
+            (provider, session_id, idempotency_key),
+        ).fetchone()
+        if supersession_request is not None:
+            raise MemoryConflictError("Write idempotency key was reused for another operation")
         if row is None:
             return None
         if row["operation"] != operation or row["payload_hash"] != payload_hash:
@@ -729,6 +797,179 @@ class MemoryDatabase:
                 str(session["session_space_id"]),
             )
 
+    def supersede_context(
+        self,
+        *,
+        provider: str,
+        session_id: str,
+        newer_document_id: str,
+        older_document_ids: Sequence[str],
+        expected_revisions: dict[str, int],
+        idempotency_key: str,
+        payload_hash: str,
+    ) -> SupersessionReceipt:
+        if not older_document_ids or len(older_document_ids) > _MAX_TOP_K:
+            raise ValueError(f"older_document_ids must contain 1-{_MAX_TOP_K} documents")
+        if len(set(older_document_ids)) != len(older_document_ids):
+            raise ValueError("older_document_ids must be unique")
+        if set(expected_revisions) != set(older_document_ids):
+            raise ValueError("An expected revision is required for every superseded document")
+        if newer_document_id in older_document_ids:
+            raise ValueError("A document cannot supersede itself")
+
+        with self._transaction() as connection:
+            session = self._get_session(connection, provider, session_id)
+            existing = connection.execute(
+                """
+                SELECT payload_hash, result_json FROM supersession_requests
+                WHERE provider = ? AND session_id = ? AND idempotency_key = ?
+                """,
+                (provider, session_id, idempotency_key),
+            ).fetchone()
+            write_request = connection.execute(
+                """
+                SELECT 1 FROM write_requests
+                WHERE provider = ? AND session_id = ? AND idempotency_key = ?
+                """,
+                (provider, session_id, idempotency_key),
+            ).fetchone()
+            if write_request is not None:
+                raise MemoryConflictError("Write idempotency key was reused for another operation")
+            if existing is not None:
+                if existing["payload_hash"] != payload_hash:
+                    raise MemoryConflictError(
+                        "Supersession idempotency key was reused with a different request"
+                    )
+                try:
+                    result = json.loads(existing["result_json"])
+                    return SupersessionReceipt(
+                        newer_document_id=result["newer_document_id"],
+                        superseded_document_ids=tuple(result["superseded_document_ids"]),
+                    )
+                except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise MemoryStorageError("Stored supersession result is invalid") from exc
+
+            newer = connection.execute(
+                """
+                SELECT d.space_id, d.status, r.record_type
+                FROM documents AS d
+                JOIN document_revisions AS r
+                  ON r.document_id = d.id AND r.revision = d.current_revision
+                WHERE d.id = ?
+                """,
+                (newer_document_id,),
+            ).fetchone()
+            if newer is None or newer["status"] == "deleted":
+                raise MemoryNotFoundError("Replacement context record not found")
+            if newer["record_type"] == "checkpoint":
+                raise MemoryConflictError("Task checkpoints cannot participate in supersession")
+            space_id = self._write_space(
+                connection, provider, session, str(newer["space_id"])
+            )
+
+            older_rows: list[sqlite3.Row] = []
+            for older_document_id in older_document_ids:
+                older = connection.execute(
+                    """
+                    SELECT d.space_id, d.current_revision, d.status, r.record_type
+                    FROM documents AS d
+                    JOIN document_revisions AS r
+                      ON r.document_id = d.id AND r.revision = d.current_revision
+                    WHERE d.id = ?
+                    """,
+                    (older_document_id,),
+                ).fetchone()
+                if older is None or older["status"] == "deleted":
+                    raise MemoryNotFoundError("Superseded context record not found")
+                if older["record_type"] == "checkpoint":
+                    raise MemoryConflictError("Task checkpoints cannot participate in supersession")
+                older_space = self._write_space(
+                    connection, provider, session, str(older["space_id"])
+                )
+                if older_space != space_id:
+                    raise MemoryConflictError("Supersession records must be in the same space")
+                if expected_revisions[older_document_id] != older["current_revision"]:
+                    raise MemoryConflictError("Superseded record revision is stale")
+                edge_exists = connection.execute(
+                    """
+                    SELECT 1 FROM supersession_edges
+                    WHERE newer_document_id = ? AND older_document_id = ?
+                    """,
+                    (newer_document_id, older_document_id),
+                ).fetchone()
+                if edge_exists is not None:
+                    raise MemoryConflictError("Supersession edge already exists")
+                cycle = connection.execute(
+                    """
+                    WITH RECURSIVE reachable(document_id) AS (
+                        SELECT ?
+                        UNION
+                        SELECT edge.older_document_id
+                        FROM supersession_edges AS edge
+                        JOIN reachable ON edge.newer_document_id = reachable.document_id
+                    )
+                    SELECT 1 FROM reachable WHERE document_id = ? LIMIT 1
+                    """,
+                    (older_document_id, newer_document_id),
+                ).fetchone()
+                if cycle is not None:
+                    raise MemoryConflictError("Supersession would create a cycle")
+                older_rows.append(older)
+
+            now = self._now()
+            for older_document_id, older in zip(older_document_ids, older_rows, strict=True):
+                connection.execute(
+                    """
+                    INSERT INTO supersession_edges(
+                        newer_document_id, older_document_id, created_by_provider,
+                        created_by_session_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (newer_document_id, older_document_id, provider, session_id, now),
+                )
+                if older["status"] == "active":
+                    connection.execute(
+                        "UPDATE documents SET status = 'superseded', updated_at = ? WHERE id = ?",
+                        (now, older_document_id),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO document_status_events(
+                            document_id, content_revision, prior_status, new_status,
+                            actor_provider, actor_session_id, created_at
+                        ) VALUES (?, ?, 'active', 'superseded', ?, ?, ?)
+                        """,
+                        (
+                            older_document_id,
+                            older["current_revision"],
+                            provider,
+                            session_id,
+                            now,
+                        ),
+                    )
+
+            receipt = SupersessionReceipt(
+                newer_document_id=newer_document_id,
+                superseded_document_ids=tuple(older_document_ids),
+            )
+            result_json = json.dumps(
+                {
+                    "newer_document_id": receipt.newer_document_id,
+                    "superseded_document_ids": receipt.superseded_document_ids,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            connection.execute(
+                """
+                INSERT INTO supersession_requests(
+                    provider, session_id, idempotency_key, payload_hash, result_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (provider, session_id, idempotency_key, payload_hash, result_json, now),
+            )
+            return receipt
+
     def _insert_revision(
         self,
         connection: sqlite3.Connection,
@@ -802,28 +1043,45 @@ class MemoryDatabase:
             )
 
     def get_record(
-        self, provider: str, session_id: str, document_id: str
+        self,
+        provider: str,
+        session_id: str,
+        document_id: str,
+        include_superseded: bool = False,
     ) -> RecordSnapshot:
         with self._lock:
             self._ensure_open()
             self._get_session(self._connection, provider, session_id)
+            status_filter = (
+                "d.status IN ('active', 'superseded')"
+                if include_superseded
+                else "d.status = 'active'"
+            )
             row = self._connection.execute(
-                """
+                f"""
                 SELECT d.id, d.space_id, r.revision, r.title, r.content, r.record_type,
                        r.metadata_json, r.source_ref, r.author_provider, r.author_session_id,
-                       r.created_at, r.task_id
+                       r.created_at, r.task_id, d.status
                 FROM documents AS d
                 JOIN document_revisions AS r
                   ON r.document_id = d.id AND r.revision = d.current_revision
                 JOIN spaces AS s ON s.id = d.space_id
-                WHERE d.id = ? AND d.status = 'active'
+                WHERE d.id = ? AND {status_filter}
                   AND s.kind IN ('provider', 'session')
                 """,
                 (document_id,),
             ).fetchone()
             if row is None:
                 raise MemoryNotFoundError("Context record not found")
-            return self._record_snapshot(row)
+            snapshot = self._record_snapshot(row)
+            supersedes, superseded_by = self._supersession_references(
+                self._connection, document_id
+            )
+            return replace(
+                snapshot,
+                supersedes=supersedes,
+                superseded_by=superseded_by,
+            )
 
     def get_checkpoint(
         self, provider: str, session_id: str, task_id: str
@@ -833,7 +1091,7 @@ class MemoryDatabase:
             self._get_session(self._connection, provider, session_id)
             row = self._connection.execute(
                 """
-                SELECT h.head_revision, d.space_id, d.id, r.revision, r.title, r.content,
+                SELECT h.head_revision, d.status, d.space_id, d.id, r.revision, r.title, r.content,
                        r.record_type, r.metadata_json, r.source_ref, r.author_provider,
                        r.author_session_id, r.created_at, r.task_id
                 FROM checkpoint_heads AS h
@@ -867,6 +1125,26 @@ class MemoryDatabase:
             author_session_id=row["author_session_id"],
             created_at=row["created_at"],
             task_id=row["task_id"],
+            status=row["status"],
+        )
+
+    @staticmethod
+    def _supersession_references(
+        connection: sqlite3.Connection, document_id: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        supersedes = connection.execute(
+            "SELECT older_document_id FROM supersession_edges "
+            "WHERE newer_document_id = ? ORDER BY older_document_id",
+            (document_id,),
+        ).fetchall()
+        superseded_by = connection.execute(
+            "SELECT newer_document_id FROM supersession_edges "
+            "WHERE older_document_id = ? ORDER BY newer_document_id",
+            (document_id,),
+        ).fetchall()
+        return (
+            tuple(str(row["older_document_id"]) for row in supersedes),
+            tuple(str(row["newer_document_id"]) for row in superseded_by),
         )
 
     def search_keyword(
@@ -877,6 +1155,7 @@ class MemoryDatabase:
         limit: int,
         space_ids: Sequence[str] | None,
         record_types: Sequence[str] | None,
+        include_superseded: bool = False,
     ) -> list[SearchCandidate]:
         if not match_query:
             return []
@@ -884,11 +1163,23 @@ class MemoryDatabase:
             self._ensure_open()
             self._get_session(self._connection, provider, session_id)
             where, filters = self._search_filters(space_ids, record_types)
+            status_filter = (
+                "d.status IN ('active', 'superseded')"
+                if include_superseded
+                else "d.status = 'active'"
+            )
             sql = f"""
                 SELECT c.id AS chunk_id, d.id AS document_id, d.space_id, r.revision,
                        r.title, r.record_type, r.metadata_json, r.source_ref,
                        r.author_provider, r.author_session_id, r.created_at,
                        c.chunk_text, c.char_start, c.char_end,
+                       d.status,
+                       (SELECT group_concat(edge.older_document_id, ',')
+                        FROM supersession_edges AS edge
+                        WHERE edge.newer_document_id = d.id) AS supersedes,
+                       (SELECT group_concat(edge.newer_document_id, ',')
+                        FROM supersession_edges AS edge
+                        WHERE edge.older_document_id = d.id) AS superseded_by,
                        bm25(chunk_fts) AS metric
                 FROM chunk_fts
                 JOIN chunks AS c ON c.id = chunk_fts.rowid
@@ -897,7 +1188,7 @@ class MemoryDatabase:
                   ON r.document_id = c.document_id AND r.revision = c.revision
                 JOIN spaces AS s ON s.id = d.space_id
                 WHERE chunk_fts MATCH ? AND d.current_revision = c.revision
-                  AND d.status = 'active' AND s.kind IN ('provider', 'session')
+                  AND {status_filter} AND s.kind IN ('provider', 'session')
                   AND {where}
                 ORDER BY metric ASC, c.id ASC
                 LIMIT ?
@@ -915,6 +1206,7 @@ class MemoryDatabase:
         limit: int,
         space_ids: Sequence[str] | None,
         record_types: Sequence[str] | None,
+        include_superseded: bool = False,
     ) -> list[SearchCandidate]:
         if len(query_vector) != EMBEDDING_DIMENSIONS:
             raise MemoryStorageError("Query embedding has an incompatible dimension")
@@ -923,12 +1215,24 @@ class MemoryDatabase:
             self._get_session(self._connection, provider, session_id)
             where, filters = self._search_filters(space_ids, record_types)
             vector = sqlite_vec.serialize_float32(query_vector)
+            status_filter = (
+                "d.status IN ('active', 'superseded')"
+                if include_superseded
+                else "d.status = 'active'"
+            )
             sql = f"""
                 WITH distances AS (
                     SELECT c.id AS chunk_id, d.id AS document_id, d.space_id, r.revision,
                            r.title, r.record_type, r.metadata_json, r.source_ref,
                            r.author_provider, r.author_session_id, r.created_at,
                            c.chunk_text, c.char_start, c.char_end,
+                           d.status,
+                           (SELECT group_concat(edge.older_document_id, ',')
+                            FROM supersession_edges AS edge
+                            WHERE edge.newer_document_id = d.id) AS supersedes,
+                           (SELECT group_concat(edge.newer_document_id, ',')
+                            FROM supersession_edges AS edge
+                            WHERE edge.older_document_id = d.id) AS superseded_by,
                            vec_distance_cosine(v.embedding, ?) AS metric
                     FROM chunk_vectors AS v
                     JOIN chunks AS c ON c.id = v.rowid
@@ -936,7 +1240,7 @@ class MemoryDatabase:
                     JOIN document_revisions AS r
                       ON r.document_id = c.document_id AND r.revision = c.revision
                     JOIN spaces AS s ON s.id = d.space_id
-                    WHERE d.current_revision = c.revision AND d.status = 'active'
+                    WHERE d.current_revision = c.revision AND {status_filter}
                       AND s.kind IN ('provider', 'session') AND {where}
                 ),
                 ranked AS (
@@ -1006,4 +1310,11 @@ class MemoryDatabase:
             char_start=row["char_start"],
             char_end=row["char_end"],
             metric=float(row["metric"]),
+            status=row["status"],
+            supersedes=tuple(sorted((row["supersedes"] or "").split(",")))
+            if row["supersedes"]
+            else (),
+            superseded_by=tuple(sorted((row["superseded_by"] or "").split(",")))
+            if row["superseded_by"]
+            else (),
         )

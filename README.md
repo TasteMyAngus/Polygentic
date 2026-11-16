@@ -118,12 +118,14 @@ arguments. `echo` accepts at most 2,048 characters.
 ## Persistent memory (Milestone 1 in progress)
 
 The MCP tools are `register_session`, `list_sessions`, `resume_session`, `put_context`,
-`get_context`, `search_context`, `put_checkpoint`, and `assemble_context`, in addition to
-`whoami` and `echo`. Records are typed as notes, decisions, constraints, findings,
-unresolved items, lessons, checkpoints, or handoffs. Writes use idempotency keys and
-revision checks; retrieval supports keyword, semantic, or hybrid search, with hybrid as the
-default. Checkpoint heads are revisioned per logical session and task, and context assembly
-returns the exact checkpoint with bounded supporting evidence.
+`get_context`, `search_context`, `supersede_context`, `put_checkpoint`, and
+`assemble_context`, in addition to `whoami` and `echo`. Records are typed as notes,
+decisions, constraints, findings, unresolved items, lessons, checkpoints, or handoffs.
+Writes use idempotency keys and revision checks; retrieval supports keyword, semantic, or
+hybrid search, with hybrid as the default. Supersession is explicit and same-space only;
+default searches hide superseded records, while history can be requested explicitly.
+Checkpoint heads are revisioned per logical session and task, and context assembly returns
+the exact checkpoint with bounded supporting evidence.
 See the [client session workflow](docs/client-workflow.md) for local state management,
 recovery, and checkpoint guidance.
 
@@ -139,8 +141,24 @@ Authenticated providers can read all provider and session spaces. A provider can
 own provider space, and a session can write its own session space. Session IDs are
 server-generated and provider-bound, but clients sharing one provider credential can claim
 another session owned by that same provider; logical sessions are not a strict security
-boundary from one another. This slice does not yet implement membership-restricted shared
-spaces, supersession, or tombstones.
+boundary from one another. Supersession is limited to records in the same space. This slice
+does not yet implement membership-restricted shared spaces or tombstones.
+
+### Retrieval evaluation
+
+Run the local synthetic retrieval benchmark with:
+
+```sh
+.venv/bin/context-evaluate-retrieval
+```
+
+The versioned fixture contains 40 records and 24 labeled questions covering exact
+identifiers, paraphrased decisions, active conflicts, and current-versus-superseded
+history. The JSON report includes per-question evidence spans and ranks, scores, statuses,
+latency, response budgets, and question-level misses separately from threshold failures.
+The command exits nonzero when a frozen threshold fails. It uses the local embedding model
+and may download `BAAI/bge-small-en-v1.5` on its first run. This synthetic benchmark is a
+regression signal, not a substitute for evaluation with representative project data.
 
 ### Local GitHub OAuth spike
 
@@ -181,7 +199,7 @@ mapping. Revoking the GitHub OAuth app grant itself remains a separate action in
 
 ## Gate 0 status
 
-On macOS, all 61 automated tests pass, including the initial memory service, configuration,
+On macOS, all 64 automated tests pass, including the initial memory service, configuration,
 and MCP cross-provider workflow tests. A local server process has completed synthetic
 authenticated MCP round trips with Codex, Claude, and Copilot provider credentials.
 Missing/invalid credentials and unexpected Host/Origin headers were rejected. The real

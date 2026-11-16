@@ -70,6 +70,7 @@ async def test_authenticated_streamable_http_tools() -> None:
         "put_context",
         "get_context",
         "search_context",
+        "supersede_context",
         "put_checkpoint",
         "assemble_context",
     }
@@ -155,7 +156,29 @@ async def test_mcp_memory_workflow_is_provider_bound_and_cross_provider_readable
                 "idempotency_key": "decision-codex",
             },
         )
-        document_id = structured_data(written)["document_id"]
+        old_document_id = structured_data(written)["document_id"]
+        replacement = await client_a.call_tool(
+            "put_context",
+            {
+                "session_id": session_a,
+                "title": "Launch decision, revised",
+                "content": "The release date is July 14.",
+                "record_type": "decision",
+                "idempotency_key": "decision-codex-revised",
+            },
+        )
+        replacement_id = structured_data(replacement)["document_id"]
+        superseded = await client_a.call_tool(
+            "supersede_context",
+            {
+                "session_id": session_a,
+                "newer_document_id": replacement_id,
+                "older_document_ids": [old_document_id],
+                "expected_revisions": {old_document_id: 1},
+                "idempotency_key": "supersede-codex-decision",
+            },
+        )
+        assert structured_data(superseded)["superseded_document_ids"] == [old_document_id]
 
         async with app_b.router.lifespan_context(app_b), Client(
             transport_for(app_b, claude_token)
@@ -174,15 +197,31 @@ async def test_mcp_memory_workflow_is_provider_bound_and_cross_provider_readable
                 },
             )
             search_results = structured_data(found)["results"]
-            assert search_results[0]["document_id"] == document_id
+            assert search_results[0]["document_id"] == replacement_id
             assert search_results[0]["author_provider"] == "codex"
+
+            history = await client_b.call_tool(
+                "search_context",
+                {
+                    "session_id": session_b,
+                    "query": "release date June",
+                    "mode": "keyword",
+                    "include_superseded": True,
+                },
+            )
+            history_results = structured_data(history)["results"]
+            historical = next(
+                result for result in history_results if result["document_id"] == old_document_id
+            )
+            assert historical["status"] == "superseded"
+            assert historical["superseded_by"] == [replacement_id]
 
             with pytest.raises(ToolError, match="Write access"):
                 await client_b.call_tool(
                     "put_context",
                     {
                         "session_id": session_b,
-                        "document_id": document_id,
+                        "document_id": replacement_id,
                         "expected_revision": 1,
                         "title": "Unauthorized",
                         "content": "A different provider cannot update this.",

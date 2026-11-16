@@ -17,6 +17,7 @@ from context_server.storage import (
     RecordSnapshot,
     SearchCandidate,
     SessionInfo,
+    SupersessionReceipt,
     WriteReceipt,
 )
 
@@ -84,6 +85,9 @@ class ContextRecord(BaseModel):
     author_session_id: str
     created_at: str
     task_id: str | None
+    status: Literal["active", "superseded"]
+    supersedes: list[str]
+    superseded_by: list[str]
     offset: int
     next_offset: int | None
     truncated: bool
@@ -103,6 +107,9 @@ class SearchHit(BaseModel):
     author_session_id: str
     created_at: str
     score: float
+    status: Literal["active", "superseded"]
+    supersedes: list[str]
+    superseded_by: list[str]
 
 
 class SearchResponse(BaseModel):
@@ -117,6 +124,11 @@ class CheckpointWriteResult(BaseModel):
     document_id: str
     document_revision: int
     head_revision: int
+
+
+class SupersessionResult(BaseModel):
+    newer_document_id: str
+    superseded_document_ids: list[str]
 
 
 class AssembledCheckpoint(BaseModel):
@@ -248,7 +260,13 @@ class MemoryService:
         return _write_result(receipt, resolved_space_id)
 
     async def get_context(
-        self, provider: str, session_id: str, document_id: str, offset: int, max_chars: int
+        self,
+        provider: str,
+        session_id: str,
+        document_id: str,
+        offset: int,
+        max_chars: int,
+        include_superseded: bool = False,
     ) -> ContextRecord:
         _validate_identifier(session_id, "session ID")
         _validate_identifier(document_id, "document ID")
@@ -257,7 +275,11 @@ class MemoryService:
         if not 1 <= max_chars <= MAX_CONTEXT_PAGE_CHARACTERS:
             raise ValueError(f"max_chars must be between 1 and {MAX_CONTEXT_PAGE_CHARACTERS}")
         record = await asyncio.to_thread(
-            self._database.get_record, provider, session_id, document_id
+            self._database.get_record,
+            provider,
+            session_id,
+            document_id,
+            include_superseded,
         )
         return _context_record(record, offset, max_chars)
 
@@ -271,6 +293,7 @@ class MemoryService:
         top_k: int = DEFAULT_TOP_K,
         space_ids: list[str] | None = None,
         record_types: list[RecordType] | None = None,
+        include_superseded: bool = False,
     ) -> SearchResponse:
         _validate_identifier(session_id, "session ID")
         if len(query) > MAX_QUERY_CHARACTERS:
@@ -312,6 +335,7 @@ class MemoryService:
                 candidate_limit,
                 space_ids,
                 record_types,
+                include_superseded,
             )
         if mode in {"hybrid", "semantic"}:
             query_vector = (await self._embedder.embed([normalized_query]))[0]
@@ -323,6 +347,7 @@ class MemoryService:
                 candidate_limit,
                 space_ids,
                 record_types,
+                include_superseded,
             )
         ranked = _reciprocal_rank_fusion(keyword_candidates, semantic_candidates, top_k)
         hits, truncated, snippet_characters = _make_search_hits(ranked, top_k)
@@ -389,6 +414,55 @@ class MemoryService:
             vectors=vectors,
         )
         return _checkpoint_result(receipt)
+
+    async def supersede_context(
+        self,
+        *,
+        provider: str,
+        session_id: str,
+        newer_document_id: str,
+        older_document_ids: list[str],
+        expected_revisions: dict[str, int],
+        idempotency_key: str,
+    ) -> SupersessionResult:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(newer_document_id, "replacement document ID")
+        _validate_identifier(idempotency_key, "idempotency key")
+        if not older_document_ids or len(older_document_ids) > MAX_TOP_K:
+            raise ValueError(f"older_document_ids must contain 1-{MAX_TOP_K} documents")
+        if len(set(older_document_ids)) != len(older_document_ids):
+            raise ValueError("older_document_ids must be unique")
+        for document_id in older_document_ids:
+            _validate_identifier(document_id, "superseded document ID")
+        if set(expected_revisions) != set(older_document_ids):
+            raise ValueError("Provide one expected revision for each superseded document")
+        for revision in expected_revisions.values():
+            _validate_expected_revision(revision)
+        ordered_ids = sorted(older_document_ids)
+        payload_hash = _payload_hash(
+            {
+                "operation": "supersede_context",
+                "newer_document_id": newer_document_id,
+                "older_document_ids": ordered_ids,
+                "expected_revisions": {
+                    document_id: expected_revisions[document_id] for document_id in ordered_ids
+                },
+            }
+        )
+        receipt: SupersessionReceipt = await asyncio.to_thread(
+            self._database.supersede_context,
+            provider=provider,
+            session_id=session_id,
+            newer_document_id=newer_document_id,
+            older_document_ids=ordered_ids,
+            expected_revisions=expected_revisions,
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash,
+        )
+        return SupersessionResult(
+            newer_document_id=receipt.newer_document_id,
+            superseded_document_ids=list(receipt.superseded_document_ids),
+        )
 
     async def assemble_context(
         self,
@@ -585,6 +659,9 @@ def _make_search_hits(
                 author_session_id=candidate.author_session_id,
                 created_at=candidate.created_at,
                 score=score,
+                status=candidate.status,  # type: ignore[arg-type]
+                supersedes=list(candidate.supersedes),
+                superseded_by=list(candidate.superseded_by),
             )
         )
         total_characters += len(snippet)
@@ -610,6 +687,9 @@ def _context_record(
         author_session_id=record.author_session_id,
         created_at=record.created_at,
         task_id=record.task_id,
+        status=record.status,  # type: ignore[arg-type]
+        supersedes=list(record.supersedes),
+        superseded_by=list(record.superseded_by),
         offset=offset,
         next_offset=end if end < len(record.content) else None,
         truncated=end < len(record.content),

@@ -25,6 +25,7 @@ from context_server.memory import (
     SearchMode,
     SearchResponse,
     SessionResult,
+    SupersessionResult,
 )
 from context_server.middleware import RequestBoundaryMiddleware
 from context_server.storage import MemoryDatabase
@@ -133,10 +134,16 @@ def create_app(
         document_id: str,
         offset: int = 0,
         max_chars: int = 16_000,
+        include_superseded: bool = False,
     ) -> ContextRecord:
-        """Read a record page with provenance and a continuation offset."""
+        """Read a record page, optionally including superseded history."""
         return await memory.get_context(
-            authenticated_provider(), session_id, document_id, offset, max_chars
+            authenticated_provider(),
+            session_id,
+            document_id,
+            offset,
+            max_chars,
+            include_superseded,
         )
 
     @mcp.tool(annotations=read_only)
@@ -147,8 +154,9 @@ def create_app(
         top_k: int = 10,
         space_ids: list[str] | None = None,
         record_types: list[RecordType] | None = None,
+        include_superseded: bool = False,
     ) -> SearchResponse:
-        """Search authorized provider/session spaces with bounded hybrid retrieval."""
+        """Search authorized spaces; superseded history is opt-in."""
         return await memory.search_context(
             provider=authenticated_provider(),
             session_id=session_id,
@@ -157,6 +165,25 @@ def create_app(
             top_k=top_k,
             space_ids=space_ids,
             record_types=record_types,
+            include_superseded=include_superseded,
+        )
+
+    @mcp.tool(annotations=write_operation)
+    async def supersede_context(
+        session_id: str,
+        newer_document_id: str,
+        older_document_ids: list[str],
+        expected_revisions: dict[str, int],
+        idempotency_key: str,
+    ) -> SupersessionResult:
+        """Explicitly supersede same-space records with expected-revision checks."""
+        return await memory.supersede_context(
+            provider=authenticated_provider(),
+            session_id=session_id,
+            newer_document_id=newer_document_id,
+            older_document_ids=older_document_ids,
+            expected_revisions=expected_revisions,
+            idempotency_key=idempotency_key,
         )
 
     @mcp.tool(annotations=write_operation)

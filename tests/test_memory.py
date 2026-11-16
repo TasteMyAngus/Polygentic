@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -130,6 +131,203 @@ async def test_cross_provider_search_is_readable_but_writes_remain_owned() -> No
                 content="Different content with the same key.",
                 record_type="decision",
                 idempotency_key="write-1",
+            )
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_supersession_is_idempotent_and_history_is_opt_in() -> None:
+    database, memory = _service()
+    try:
+        session = await memory.register_session("codex", "Supersession", "register-supersession")
+        older = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            title="Legacy migration decision",
+            content="The migration plan used maplewood as its storage engine.",
+            record_type="decision",
+            idempotency_key="supersession-old",
+        )
+        newer = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            title="Current migration decision",
+            content="The migration plan uses bluebird as its storage engine.",
+            record_type="decision",
+            idempotency_key="supersession-new",
+        )
+        request = {
+            "provider": "codex",
+            "session_id": session.session_id,
+            "newer_document_id": newer.document_id,
+            "older_document_ids": [older.document_id],
+            "expected_revisions": {older.document_id: 1},
+            "idempotency_key": "supersession-edge-1",
+        }
+
+        result = await memory.supersede_context(**request)
+        replay = await memory.supersede_context(**request)
+        assert replay == result
+        assert result.superseded_document_ids == [older.document_id]
+
+        default_search = await memory.search_context(
+            provider="codex",
+            session_id=session.session_id,
+            query="maplewood",
+            mode="keyword",
+        )
+        assert all(hit.document_id != older.document_id for hit in default_search.results)
+        history_search = await memory.search_context(
+            provider="codex",
+            session_id=session.session_id,
+            query="maplewood",
+            mode="keyword",
+            include_superseded=True,
+        )
+        historical_hit = next(hit for hit in history_search.results if hit.document_id == older.document_id)
+        assert historical_hit.status == "superseded"
+        assert historical_hit.superseded_by == [newer.document_id]
+
+        with pytest.raises(MemoryNotFoundError, match="Context record not found"):
+            await memory.get_context("codex", session.session_id, older.document_id, 0, 1000)
+        historical_record = await memory.get_context(
+            "codex",
+            session.session_id,
+            older.document_id,
+            0,
+            1000,
+            include_superseded=True,
+        )
+        assert historical_record.status == "superseded"
+        assert historical_record.superseded_by == [newer.document_id]
+        current_record = await memory.get_context(
+            "codex", session.session_id, newer.document_id, 0, 1000
+        )
+        assert current_record.supersedes == [older.document_id]
+
+        event_count = database._connection.execute(
+            "SELECT count(*) FROM document_status_events WHERE document_id = ?",
+            (older.document_id,),
+        ).fetchone()[0]
+        assert event_count == 1
+        with pytest.raises(MemoryConflictError, match="idempotency key"):
+            await memory.supersede_context(
+                **{**request, "expected_revisions": {older.document_id: 2}}
+            )
+        with pytest.raises(MemoryConflictError, match="idempotency key"):
+            await memory.put_context(
+                provider="codex",
+                session_id=session.session_id,
+                title="Wrong operation",
+                content="This key was already used for supersession.",
+                record_type="note",
+                idempotency_key="supersession-edge-1",
+            )
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_supersession_rejects_cycles_stale_revisions_and_cross_space_edges() -> None:
+    database, memory = _service()
+    try:
+        session = await memory.register_session("codex", "Supersession graph", "register-graph")
+        first = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            title="First",
+            content="First historical decision.",
+            record_type="decision",
+            idempotency_key="graph-first",
+        )
+        second = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            title="Second",
+            content="Second replacement decision.",
+            record_type="decision",
+            idempotency_key="graph-second",
+        )
+        third = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            title="Third",
+            content="Third replacement decision.",
+            record_type="decision",
+            idempotency_key="graph-third",
+        )
+        await memory.supersede_context(
+            provider="codex",
+            session_id=session.session_id,
+            newer_document_id=second.document_id,
+            older_document_ids=[first.document_id],
+            expected_revisions={first.document_id: 1},
+            idempotency_key="graph-edge-1",
+        )
+        await memory.supersede_context(
+            provider="codex",
+            session_id=session.session_id,
+            newer_document_id=third.document_id,
+            older_document_ids=[second.document_id],
+            expected_revisions={second.document_id: 1},
+            idempotency_key="graph-edge-2",
+        )
+        with pytest.raises(MemoryConflictError, match="cycle"):
+            await memory.supersede_context(
+                provider="codex",
+                session_id=session.session_id,
+                newer_document_id=first.document_id,
+                older_document_ids=[third.document_id],
+                expected_revisions={third.document_id: 1},
+                idempotency_key="graph-cycle",
+            )
+
+        stale = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            title="Stale candidate",
+            content="A second old decision.",
+            record_type="decision",
+            idempotency_key="graph-stale",
+        )
+        with pytest.raises(MemoryConflictError, match="revision is stale"):
+            await memory.supersede_context(
+                provider="codex",
+                session_id=session.session_id,
+                newer_document_id=third.document_id,
+                older_document_ids=[first.document_id, stale.document_id],
+                expected_revisions={first.document_id: 1, stale.document_id: 2},
+                idempotency_key="graph-stale-revisions",
+            )
+        first_after_failure = await memory.get_context(
+            "codex",
+            session.session_id,
+            first.document_id,
+            0,
+            1000,
+            include_superseded=True,
+        )
+        assert first_after_failure.superseded_by == [second.document_id]
+        assert stale.document_id not in first_after_failure.superseded_by
+
+        provider_record = await memory.put_context(
+            provider="codex",
+            session_id=session.session_id,
+            space_id=session.provider_space_id,
+            title="Provider-space decision",
+            content="Provider-wide legacy decision.",
+            record_type="decision",
+            idempotency_key="graph-provider",
+        )
+        with pytest.raises(MemoryConflictError, match="same space"):
+            await memory.supersede_context(
+                provider="codex",
+                session_id=session.session_id,
+                newer_document_id=third.document_id,
+                older_document_ids=[provider_record.document_id],
+                expected_revisions={provider_record.document_id: 1},
+                idempotency_key="graph-cross-space",
             )
     finally:
         database.close()
@@ -285,3 +483,35 @@ async def test_persistent_store_reopens_with_sessions_and_vectors(tmp_path: Path
         assert restored.revision == 1
     finally:
         second_database.close()
+
+
+def test_schema_v1_migrates_to_supersession_schema_v2(tmp_path: Path) -> None:
+    data_dir = tmp_path / "legacy-memory"
+    initial = MemoryDatabase(data_dir)
+    initial.close()
+
+    connection = sqlite3.connect(data_dir / "context.sqlite3")
+    connection.execute("DROP TABLE supersession_requests")
+    connection.execute("DROP TABLE document_status_events")
+    connection.execute("DROP TABLE supersession_edges")
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    migrated = MemoryDatabase(data_dir)
+    try:
+        version = migrated._connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row["name"]
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert version == 2
+        assert {
+            "supersession_edges",
+            "document_status_events",
+            "supersession_requests",
+        } <= tables
+    finally:
+        migrated.close()

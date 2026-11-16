@@ -1,2 +1,181 @@
 # Polygentic
-Shared context server for multi-provider workflows
+
+Shared context server for multi-provider workflows.
+
+An authenticated MCP context server for sharing persistent context between agent providers.
+
+## Current milestone
+
+This repository currently contains only the Gate 0 connectivity spike: an authenticated
+Streamable HTTP MCP server with `whoami` and bounded `echo` tools. It does not yet store
+context, create sessions, or provide vector search.
+
+The service binds to loopback by default. Do not expose it through Tailscale Funnel or any
+other public endpoint until the authentication, client-compatibility, and deployment gates
+are complete. A bearer token is a secret; configure clients to supply it as an authorization
+header and never put it in a repository or agent-visible instructions.
+
+## Local development
+
+Requirements: Python 3.12 or 3.13. On macOS, create a development environment with:
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install --no-deps -e .
+.venv/bin/pytest
+.venv/bin/ruff check .
+.venv/bin/mypy src
+```
+
+If Python was installed by `uv`, add `~/.local/bin` to your `PATH` when needed.
+`pyproject.toml` and `uv.lock` are the dependency sources of truth.
+`requirements.txt` is a pinned export including development dependencies. After changing
+dependencies, install `uv`, update the lock with `uv lock`, and regenerate the export:
+
+```sh
+uv export --locked --extra dev --no-emit-project --no-hashes --no-header \
+  --format requirements-txt --output-file requirements.txt --quiet
+```
+
+Create a credentials JSON file outside the repository. The server stores only SHA-256
+digests of high-entropy bearer tokens, not the bearer tokens themselves.
+
+### macOS
+
+For local testing, generate a token and digest in your terminal without writing the token
+to disk. Keep the token private; do not paste it into chat or commit it.
+
+```sh
+token=$(.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))')
+digest=$(printf '%s' "$token" | .venv/bin/python -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+printf 'Token digest: %s\n' "$digest"
+```
+
+The token remains in the current shell variable for configuring the client. Store the
+digest in a credentials JSON file as described below, then restrict and use that file:
+
+```sh
+chmod 600 /path/to/private/credentials.json
+CONTEXT_SERVER_CREDENTIALS_FILE=/path/to/private/credentials.json .venv/bin/context-server
+```
+
+### Windows PowerShell
+
+For local testing, generate a token and digest without writing the token to disk:
+
+```powershell
+$token = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$digest = python -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" $token
+```
+
+Set `CONTEXT_SERVER_CREDENTIALS_FILE` to the file path, then run:
+
+```powershell
+$env:CONTEXT_SERVER_CREDENTIALS_FILE = "C:\secure\context-server-credentials.json"
+uv run context-server
+```
+
+### Credentials file
+
+Create a JSON file such as:
+
+```json
+{
+  "version": 1,
+  "credentials": [
+    {
+      "provider": "codex",
+      "token_sha256": "REPLACE_WITH_THE_DIGEST"
+    }
+  ]
+}
+```
+
+On macOS, restrict the file to the service account (`chmod 600 <file>`). The production
+deployment must use OS-protected configuration and a private persistent path. The file
+contains verifier material and should still be kept private. Do not commit it.
+
+Configure an MCP client for Streamable HTTP at `http://127.0.0.1:8000/mcp`, with the
+header `Authorization: Bearer <token>`. HTTP requests are limited to 1 MiB and the
+process accepts at most 600 requests per minute. These application-level limits are not
+a substitute for upstream DDoS protection. Configure `CONTEXT_SERVER_ALLOWED_HOSTS` and
+`CONTEXT_SERVER_ALLOWED_ORIGINS` explicitly when testing a different local host/origin.
+Origins are denied by default when supplied; native MCP clients that do not send an Origin
+header are unaffected. The HTTP host must always match the configured host allowlist.
+
+The server refuses to start without configured provider credentials. `whoami` returns the
+provider bound to the verified credential; callers cannot select a provider through tool
+arguments. `echo` accepts at most 2,048 characters.
+
+### Local GitHub OAuth spike
+
+The optional OAuth mode binds an OAuth login for the configured GitHub account to the
+`claude` provider by default, while existing bearer credentials continue to work. The
+administrator can select another provider at startup with
+`CONTEXT_SERVER_GITHUB_PROVIDER`. This binding applies to every OAuth login in that
+server instance; the caller cannot select its own provider. FastMCP stores OAuth state
+and tokens in its encrypted file-backed store by default; restart recovery still needs
+deployment-level verification. This test setup is not approved for persistent public
+exposure or production deployment.
+
+Create a GitHub OAuth app with callback `http://localhost:8000/auth/callback`, and store
+its client secret in an owner-only file outside the repository. With the bearer
+credentials file configured as above, start the local server with:
+
+```sh
+CONTEXT_SERVER_CREDENTIALS_FILE=/path/to/private/credentials.json \
+CONTEXT_SERVER_GITHUB_CLIENT_ID=YOUR_CLIENT_ID \
+CONTEXT_SERVER_GITHUB_CLIENT_SECRET_FILE=/path/to/private/github-oauth-secret \
+CONTEXT_SERVER_GITHUB_ADMIN_USER_ID="$(gh api user --jq .id)" \
+CONTEXT_SERVER_ALLOWED_ORIGINS=http://localhost:8000 \
+.venv/bin/context-server
+```
+
+The GitHub CLI account used for the administrator ID must be the approved account.
+Access logging is disabled in this mode to avoid logging OAuth callback codes.
+For hosted-connector compatibility preparation, `CONTEXT_SERVER_OAUTH_BASE_URL` can
+set the HTTPS origin used in OAuth metadata and enable Claude's exact hosted callback
+URI (`https://claude.ai/api/mcp/auth_callback`). This setting does not expose the server;
+the process still binds to loopback. When using an external HTTPS origin, the GitHub OAuth
+app callback must be changed to that origin's `/auth/callback`. A single Claude.ai hosted
+connector test over temporary Funnel HTTPS passed; the temporary server and route were
+stopped afterward. Persistent public access and production deployment remain unverified.
+The advertised OAuth revocation endpoint immediately invalidates the local MCP token
+mapping. Revoking the GitHub OAuth app grant itself remains a separate action in GitHub.
+
+## Gate 0 status
+
+On macOS, all 48 automated tests pass and a local server process has completed synthetic
+authenticated MCP round trips with Codex, Claude, and Copilot provider credentials.
+Missing/invalid credentials and unexpected Host/Origin headers were rejected.
+
+FastMCP was upgraded from 2.14.7 to 3.4.11, which includes the fix for
+[GHSA-rww4-4w9c-7733](https://github.com/advisories/GHSA-rww4-4w9c-7733).
+A regression test checks that an OAuth callback from a different browser is rejected
+before the upstream token exchange. This upgrade alone does not establish that the
+service is ready for public exposure.
+
+A local FastMCP client completed GitHub OAuth and called `whoami` and `echo` with the
+configured administrator account on FastMCP 3.4.11. This is not a test of the hosted
+connector.
+
+| Client | Local Streamable HTTP result | Authentication |
+|---|---|---|
+| Codex CLI 0.169.0 | Discovered and called `whoami` and `echo`; `whoami` returned `codex` on FastMCP 3.4.11 | Bearer token from environment |
+| Claude Code 2.1.311 | Discovered and called `whoami` and `echo`; `whoami` returned `claude` on FastMCP 3.4.11 | Bearer header from environment |
+| VS Code Copilot | Discovered and called `whoami` and `echo`; `whoami` returned `copilot` on FastMCP 3.4.11 | Temporary bearer token in owner-only Copilot user config |
+| Claude.ai hosted connector | Discovered, completed OAuth, and called `whoami` (`claude`) and `echo` (`hosted test`, length 11) over HTTPS | GitHub OAuth through a temporary Tailscale Funnel route |
+
+These were isolated synthetic tests with temporary credentials. The Codex test enabled
+automatic approval only for the test server's read-only tools. The tools advertise
+read-only annotations; those hints are not an authorization boundary.
+
+The Claude hosted-connector test used synthetic echo text and a temporary Funnel route.
+The route was reset and the server stopped after the test; no public server is currently
+exposed. Not yet verified: GitHub Copilot cloud agent, production Mac mini deployment,
+upstream GitHub grant revocation, and persistent external operation. FastMCP's encrypted storage is
+configured and transaction recovery is covered by a test, but deployment-level restart
+recovery remains unverified. Request-size and process-wide rate limits are implemented,
+but they are not a substitute for upstream DDoS protection. Do not enable persistent
+public access until the remaining checks pass.

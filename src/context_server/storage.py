@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import stat
+import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -18,7 +19,7 @@ import sqlite_vec  # type: ignore[import-untyped]
 
 from context_server.embeddings import EMBEDDING_DIMENSIONS
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_TOP_K = 50
 
 
@@ -61,6 +62,43 @@ class WriteReceipt:
 class SupersessionReceipt:
     newer_document_id: str
     superseded_document_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SpaceMemberInfo:
+    session_id: str
+    provider: str
+    role: str
+
+
+@dataclass(frozen=True)
+class SpaceInfo:
+    space_id: str
+    kind: str
+    name: str
+    project_space_id: str | None
+    owner_session_id: str
+    owner_provider: str
+    archived_at: str | None
+    members: tuple[SpaceMemberInfo, ...]
+
+
+@dataclass(frozen=True)
+class SpaceInvitationInfo:
+    invitation_id: str
+    space_id: str
+    space_name: str
+    owner_session_id: str
+    inviter_session_id: str
+    invited_session_id: str
+    status: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class RegisteredSessionInfo:
+    session_id: str
+    provider: str
 
 
 @dataclass(frozen=True)
@@ -177,6 +215,218 @@ class MemoryDatabase:
                 self._connection.close()
                 self._closed = True
 
+    def backup_to(self, destination: Path, *, overwrite: bool = False) -> Path:
+        if self._database_path is None:
+            raise MemoryStorageError("An in-memory database cannot be backed up to a file")
+        backup_path = destination.expanduser().absolute()
+        if backup_path.resolve() == self._database_path.resolve():
+            raise MemoryStorageError("Backup destination must differ from the live database")
+        if backup_path.is_symlink():
+            raise MemoryStorageError("Backup destination must not be a symbolic link")
+        if backup_path.exists():
+            backup_stat = backup_path.stat()
+            if not stat.S_ISREG(backup_stat.st_mode):
+                raise MemoryStorageError("Backup destination must be a regular file")
+            if os.name == "posix" and backup_stat.st_uid != os.getuid():
+                raise MemoryStorageError("Backup destination must be owned by the service user")
+            if not overwrite:
+                raise MemoryConflictError(
+                    "Backup destination already exists; pass overwrite=True to replace it"
+                )
+
+        parent = backup_path.parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            raise MemoryStorageError("Backup destination parent must be a directory")
+        if os.name == "posix" and parent.stat().st_uid != os.getuid():
+            raise MemoryStorageError("Backup destination parent must be owned by the service user")
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{backup_path.name}.",
+                suffix=".tmp",
+                dir=parent,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                os.chmod(temporary_path, 0o600)
+            with self._lock:
+                self._ensure_open()
+                target = sqlite3.connect(temporary_path)
+                try:
+                    self._connection.backup(target)
+                    target.enable_load_extension(True)
+                    sqlite_vec.load(target)
+                    target.enable_load_extension(False)
+                    check = target.execute("PRAGMA quick_check").fetchone()
+                    if check is None or check[0] != "ok":
+                        raise MemoryStorageError("Database backup failed its integrity check")
+                    if target.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                        raise MemoryStorageError("Database backup contains foreign-key violations")
+                finally:
+                    target.close()
+            with temporary_path.open("rb") as backup_file:
+                os.fsync(backup_file.fileno())
+            os.replace(temporary_path, backup_path)
+            temporary_path = None
+            os.chmod(backup_path, 0o600)
+            if os.name == "posix":
+                parent_fd = os.open(parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            return backup_path
+        except sqlite3.Error as exc:
+            raise MemoryStorageError("Unable to create a consistent SQLite backup") from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @classmethod
+    def restore_from_backup(
+        cls,
+        source: Path,
+        data_dir: Path,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        backup_path = source.expanduser()
+        if backup_path.is_symlink():
+            raise MemoryStorageError("Backup source must not be a symbolic link")
+        try:
+            source_stat = backup_path.stat()
+        except OSError as exc:
+            raise MemoryStorageError("Unable to read database backup") from exc
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise MemoryStorageError("Backup source must be a regular file")
+        if os.name == "posix":
+            if source_stat.st_uid != os.getuid():
+                raise MemoryStorageError("Backup source must be owned by the service user")
+            if stat.S_IMODE(source_stat.st_mode) & 0o077:
+                raise MemoryStorageError("Backup source permissions must be owner-only")
+
+        resolved_source = backup_path.resolve()
+        cls._prepare_data_dir(data_dir)
+        database_path = data_dir / "context.sqlite3"
+        if resolved_source == database_path.resolve():
+            raise MemoryStorageError("Restore source must differ from the destination database")
+        if database_path.is_symlink():
+            raise MemoryStorageError("Destination database must not be a symbolic link")
+        if database_path.exists():
+            database_stat = database_path.stat()
+            if not stat.S_ISREG(database_stat.st_mode):
+                raise MemoryStorageError("Destination database must be a regular file")
+            if os.name == "posix" and database_stat.st_uid != os.getuid():
+                raise MemoryStorageError("Destination database must be owned by the service user")
+            if not overwrite:
+                raise MemoryConflictError(
+                    "Destination database already exists; pass overwrite=True to replace it"
+                )
+
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".context-restore-", dir=data_dir
+            ) as temporary_dir:
+                stage_dir = Path(temporary_dir)
+                cls._prepare_data_dir(stage_dir)
+                staged_path = stage_dir / "context.sqlite3"
+                ready_path = stage_dir / "restored.sqlite3"
+                source_connection = sqlite3.connect(
+                    f"{resolved_source.as_uri()}?mode=ro", uri=True
+                )
+                try:
+                    schema_version = int(
+                        source_connection.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    if not 1 <= schema_version <= _SCHEMA_VERSION:
+                        raise MemoryStorageError("Backup has an unsupported database schema")
+                    source_connection.enable_load_extension(True)
+                    sqlite_vec.load(source_connection)
+                    source_connection.enable_load_extension(False)
+                    if source_connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                        raise MemoryStorageError("Backup failed its integrity check")
+                    if (
+                        source_connection.execute("PRAGMA foreign_key_check").fetchone()
+                        is not None
+                    ):
+                        raise MemoryStorageError("Backup contains foreign-key violations")
+                    staged_connection = sqlite3.connect(staged_path)
+                    try:
+                        source_connection.backup(staged_connection)
+                    finally:
+                        staged_connection.close()
+                finally:
+                    source_connection.close()
+
+                staged = cls(stage_dir)
+                try:
+                    check = staged._connection.execute("PRAGMA quick_check").fetchone()
+                    if check is None or check[0] != "ok":
+                        raise MemoryStorageError("Restored database failed its integrity check")
+                    if (
+                        staged._connection.execute("PRAGMA foreign_key_check").fetchone()
+                        is not None
+                    ):
+                        raise MemoryStorageError(
+                            "Restored database contains foreign-key violations"
+                        )
+                    ready = sqlite3.connect(ready_path)
+                    try:
+                        staged._connection.backup(ready)
+                        ready.enable_load_extension(True)
+                        sqlite_vec.load(ready)
+                        ready.enable_load_extension(False)
+                        if ready.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                            raise MemoryStorageError(
+                                "Final restored database failed its integrity check"
+                            )
+                    finally:
+                        ready.close()
+                finally:
+                    staged.close()
+
+                if database_path.exists():
+                    try:
+                        current = sqlite3.connect(database_path)
+                        try:
+                            checkpoint = current.execute(
+                                "PRAGMA wal_checkpoint(TRUNCATE)"
+                            ).fetchone()
+                            if checkpoint is None or checkpoint[0] != 0:
+                                raise MemoryConflictError(
+                                    "Unable to checkpoint destination; stop the server before restore"
+                                )
+                        finally:
+                            current.close()
+                    except sqlite3.Error as exc:
+                        raise MemoryStorageError(
+                            "Unable to prepare destination database; stop the server before restore"
+                        ) from exc
+
+                for suffix in ("-wal", "-shm"):
+                    sidecar = Path(f"{database_path}{suffix}")
+                    if sidecar.is_symlink():
+                        raise MemoryStorageError("Database sidecars must not be symbolic links")
+                    if sidecar.exists():
+                        raise MemoryConflictError(
+                            "Database sidecars remain; stop all server processes before restore"
+                        )
+                os.replace(ready_path, database_path)
+                os.chmod(database_path, 0o600)
+                if os.name == "posix":
+                    directory_fd = os.open(data_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+        except sqlite3.DatabaseError as exc:
+            raise MemoryStorageError("Backup is not a valid SQLite database") from exc
+        except sqlite3.Error as exc:
+            raise MemoryStorageError("Unable to validate or restore the database backup") from exc
+        return database_path
+
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
@@ -205,6 +455,10 @@ class MemoryDatabase:
             return
         if current_version == 1:
             self._migrate_v1_to_v2()
+            self._migrate_v2_to_v3()
+            return
+        if current_version == 2:
+            self._migrate_v2_to_v3()
             return
         self._connection.executescript(
             """
@@ -311,6 +565,7 @@ class MemoryDatabase:
             """
         )
         self._migrate_v1_to_v2()
+        self._migrate_v2_to_v3()
 
     def _migrate_v1_to_v2(self) -> None:
         self._connection.executescript(
@@ -351,6 +606,76 @@ class MemoryDatabase:
                 PRIMARY KEY(provider, session_id, idempotency_key)
             );
             PRAGMA user_version = 2;
+            COMMIT;
+            """
+        )
+
+    def _migrate_v2_to_v3(self) -> None:
+        self._connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE spaces ADD COLUMN space_type TEXT NOT NULL DEFAULT 'session'
+                CHECK (space_type IN ('provider', 'session', 'project', 'shared'));
+            ALTER TABLE spaces ADD COLUMN name TEXT NOT NULL DEFAULT '';
+            ALTER TABLE spaces ADD COLUMN archived_at TEXT;
+            ALTER TABLE spaces ADD COLUMN project_space_id TEXT REFERENCES spaces(id)
+                CHECK (project_space_id IS NULL OR space_type = 'shared');
+            UPDATE spaces SET space_type = 'provider' WHERE kind = 'provider';
+            DROP INDEX session_space_owner;
+            CREATE UNIQUE INDEX session_space_owner
+                ON spaces(owner_session_id) WHERE space_type = 'session';
+
+            CREATE TABLE space_memberships (
+                space_id TEXT NOT NULL REFERENCES spaces(id),
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                role TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+                added_by_session_id TEXT NOT NULL REFERENCES sessions(id),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(space_id, session_id)
+            );
+            CREATE INDEX space_memberships_by_session
+                ON space_memberships(session_id, space_id);
+
+            CREATE TABLE space_invitations (
+                id TEXT PRIMARY KEY,
+                space_id TEXT NOT NULL REFERENCES spaces(id),
+                invited_session_id TEXT NOT NULL REFERENCES sessions(id),
+                invited_by_session_id TEXT NOT NULL REFERENCES sessions(id),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'revoked', 'left')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX one_pending_space_invitation
+                ON space_invitations(space_id, invited_session_id)
+                WHERE status = 'pending';
+            CREATE INDEX space_invitations_by_target
+                ON space_invitations(invited_session_id, status, created_at DESC);
+            CREATE INDEX space_invitations_by_inviter
+                ON space_invitations(invited_by_session_id, status, created_at DESC);
+
+            CREATE TABLE space_membership_events (
+                id INTEGER PRIMARY KEY,
+                space_id TEXT NOT NULL REFERENCES spaces(id),
+                subject_session_id TEXT NOT NULL REFERENCES sessions(id),
+                actor_session_id TEXT NOT NULL REFERENCES sessions(id),
+                event TEXT NOT NULL CHECK (
+                    event IN ('created', 'invited', 'accepted', 'revoked', 'left', 'archived')
+                ),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX space_membership_events_by_space
+                ON space_membership_events(space_id, id);
+
+            CREATE TABLE space_creation_requests (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                idempotency_key TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                space_id TEXT NOT NULL REFERENCES spaces(id),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id, idempotency_key)
+            );
+            PRAGMA user_version = 3;
             COMMIT;
             """
         )
@@ -408,7 +733,8 @@ class MemoryDatabase:
             now = self._now()
             if provider_space is None:
                 connection.execute(
-                    "INSERT INTO spaces(id, kind, provider, created_at) VALUES (?, 'provider', ?, ?)",
+                    "INSERT INTO spaces(id, kind, provider, space_type, created_at) "
+                    "VALUES (?, 'provider', ?, 'provider', ?)",
                     (provider_space_id, provider, now),
                 )
             connection.execute(
@@ -480,6 +806,512 @@ class MemoryDatabase:
             row = self._get_session(self._connection, provider, session_id)
             return str(row["session_space_id"])
 
+    @staticmethod
+    def _space_info(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> SpaceInfo:
+        members = connection.execute(
+            """
+            SELECT m.session_id, s.provider, m.role
+            FROM space_memberships AS m
+            JOIN sessions AS s ON s.id = m.session_id
+            WHERE m.space_id = ?
+            ORDER BY CASE m.role WHEN 'owner' THEN 0 ELSE 1 END, m.session_id
+            """,
+            (row["id"],),
+        ).fetchall()
+        return SpaceInfo(
+            space_id=str(row["id"]),
+            kind=str(row["space_type"]),
+            name=str(row["name"]),
+            project_space_id=row["project_space_id"],
+            owner_session_id=str(row["owner_session_id"]),
+            owner_provider=str(row["provider"]),
+            archived_at=row["archived_at"],
+            members=tuple(
+                SpaceMemberInfo(
+                    session_id=str(member["session_id"]),
+                    provider=str(member["provider"]),
+                    role=str(member["role"]),
+                )
+                for member in members
+            ),
+        )
+
+    @staticmethod
+    def _invitation_info(row: sqlite3.Row) -> SpaceInvitationInfo:
+        return SpaceInvitationInfo(
+            invitation_id=str(row["id"]),
+            space_id=str(row["space_id"]),
+            space_name=str(row["name"]),
+            owner_session_id=str(row["owner_session_id"]),
+            inviter_session_id=str(row["invited_by_session_id"]),
+            invited_session_id=str(row["invited_session_id"]),
+            status=str(row["status"]),
+            created_at=str(row["created_at"]),
+        )
+
+    def list_registered_sessions(self) -> list[RegisteredSessionInfo]:
+        with self._lock:
+            self._ensure_open()
+            rows = self._connection.execute(
+                "SELECT id, provider FROM sessions ORDER BY provider, id"
+            ).fetchall()
+            return [
+                RegisteredSessionInfo(
+                    session_id=str(row["id"]), provider=str(row["provider"])
+                )
+                for row in rows
+            ]
+
+    def create_space(
+        self,
+        provider: str,
+        session_id: str,
+        kind: str,
+        name: str,
+        idempotency_key: str,
+        payload_hash: str,
+        project_space_id: str | None = None,
+    ) -> SpaceInfo:
+        if kind not in {"project", "shared"}:
+            raise ValueError("Shared space kind must be project or shared")
+        if project_space_id is not None and kind != "shared":
+            raise ValueError("Only ad-hoc shared spaces can reference a project space")
+        with self._transaction() as connection:
+            self._get_session(connection, provider, session_id)
+            request = connection.execute(
+                """
+                SELECT payload_hash, space_id FROM space_creation_requests
+                WHERE provider = ? AND session_id = ? AND idempotency_key = ?
+                """,
+                (provider, session_id, idempotency_key),
+            ).fetchone()
+            if request is not None:
+                if request["payload_hash"] != payload_hash:
+                    raise MemoryConflictError(
+                        "Space creation idempotency key was reused with a different request"
+                    )
+                existing_space = connection.execute(
+                    "SELECT * FROM spaces WHERE id = ?", (request["space_id"],)
+                ).fetchone()
+                if existing_space is None:
+                    raise MemoryStorageError("Created shared space could not be read")
+                return self._space_info(connection, existing_space)
+            if project_space_id is not None:
+                project = connection.execute(
+                    """
+                    SELECT 1 FROM spaces AS s
+                    WHERE s.id = ? AND s.space_type = 'project' AND s.archived_at IS NULL
+                      AND (
+                        s.owner_session_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM space_memberships AS m
+                            WHERE m.space_id = s.id AND m.session_id = ?
+                        )
+                      )
+                    """,
+                    (project_space_id, session_id, session_id),
+                ).fetchone()
+                if project is None:
+                    raise MemoryNotFoundError("Project space not found")
+            space_id = str(uuid4())
+            now = self._now()
+            connection.execute(
+                """
+                INSERT INTO spaces(
+                    id, kind, provider, owner_session_id, space_type, name,
+                    project_space_id, created_at
+                ) VALUES (?, 'session', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    space_id,
+                    provider,
+                    session_id,
+                    kind,
+                    name,
+                    project_space_id,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_memberships(
+                    space_id, session_id, role, added_by_session_id, created_at
+                ) VALUES (?, ?, 'owner', ?, ?)
+                """,
+                (space_id, session_id, session_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_membership_events(
+                    space_id, subject_session_id, actor_session_id, event, created_at
+                ) VALUES (?, ?, ?, 'created', ?)
+                """,
+                (space_id, session_id, session_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_creation_requests(
+                    provider, session_id, idempotency_key, payload_hash, space_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (provider, session_id, idempotency_key, payload_hash, space_id, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM spaces WHERE id = ?", (space_id,)
+            ).fetchone()
+            if row is None:
+                raise MemoryStorageError("Created shared space could not be read")
+            return self._space_info(connection, row)
+
+    def list_spaces(self, provider: str, session_id: str) -> list[SpaceInfo]:
+        with self._lock:
+            self._ensure_open()
+            self._get_session(self._connection, provider, session_id)
+            rows = self._connection.execute(
+                """
+                SELECT s.*
+                FROM spaces AS s
+                WHERE s.space_type IN ('project', 'shared')
+                  AND (
+                    (s.archived_at IS NULL AND EXISTS (
+                        SELECT 1 FROM space_memberships AS m
+                        WHERE m.space_id = s.id AND m.session_id = ?
+                    ))
+                    OR s.owner_session_id = ?
+                  )
+                ORDER BY s.name COLLATE NOCASE, s.id
+                """,
+                (session_id, session_id),
+            ).fetchall()
+            return [self._space_info(self._connection, row) for row in rows]
+
+    def get_space(
+        self, provider: str, session_id: str, space_id: str
+    ) -> SpaceInfo:
+        with self._lock:
+            self._ensure_open()
+            self._get_session(self._connection, provider, session_id)
+            row = self._connection.execute(
+                """
+                SELECT s.*
+                FROM spaces AS s
+                WHERE s.id = ? AND s.space_type IN ('project', 'shared')
+                  AND (
+                    s.owner_session_id = ?
+                    OR (s.archived_at IS NULL AND EXISTS (
+                        SELECT 1 FROM space_memberships AS m
+                        WHERE m.space_id = s.id AND m.session_id = ?
+                    ))
+                  )
+                """,
+                (space_id, session_id, session_id),
+            ).fetchone()
+            if row is None:
+                raise MemoryNotFoundError("Shared space not found")
+            return self._space_info(self._connection, row)
+
+    def invite_session(
+        self, provider: str, session_id: str, space_id: str, target_session_id: str
+    ) -> SpaceInvitationInfo:
+        with self._transaction() as connection:
+            self._get_session(connection, provider, session_id)
+            space = connection.execute(
+                """
+                SELECT * FROM spaces
+                WHERE id = ? AND space_type IN ('project', 'shared')
+                  AND owner_session_id = ? AND archived_at IS NULL
+                """,
+                (space_id, session_id),
+            ).fetchone()
+            if space is None:
+                raise MemoryNotFoundError("Shared space not found")
+            target = connection.execute(
+                "SELECT id FROM sessions WHERE id = ?", (target_session_id,)
+            ).fetchone()
+            if target is None:
+                raise MemoryNotFoundError("Invitation target session not found")
+            member = connection.execute(
+                "SELECT 1 FROM space_memberships WHERE space_id = ? AND session_id = ?",
+                (space_id, target_session_id),
+            ).fetchone()
+            if member is not None:
+                raise MemoryConflictError("Session is already a space member")
+            existing = connection.execute(
+                """
+                SELECT * FROM space_invitations
+                WHERE space_id = ? AND invited_session_id = ? AND status = 'pending'
+                """,
+                (space_id, target_session_id),
+            ).fetchone()
+            if existing is not None:
+                return self._invitation_info(
+                    self._join_invitation_space(connection, existing)
+                )
+
+            invitation_id = str(uuid4())
+            now = self._now()
+            connection.execute(
+                """
+                INSERT INTO space_invitations(
+                    id, space_id, invited_session_id, invited_by_session_id,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (invitation_id, space_id, target_session_id, session_id, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_membership_events(
+                    space_id, subject_session_id, actor_session_id, event, created_at
+                ) VALUES (?, ?, ?, 'invited', ?)
+                """,
+                (space_id, target_session_id, session_id, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM space_invitations WHERE id = ?", (invitation_id,)
+            ).fetchone()
+            if row is None:
+                raise MemoryStorageError("Created invitation could not be read")
+            return self._invitation_info(self._join_invitation_space(connection, row))
+
+    @staticmethod
+    def _join_invitation_space(
+        connection: sqlite3.Connection, invitation: sqlite3.Row
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """
+            SELECT i.*, s.name, s.owner_session_id
+            FROM space_invitations AS i
+            JOIN spaces AS s ON s.id = i.space_id
+            WHERE i.id = ?
+            """,
+            (invitation["id"],),
+        ).fetchone()
+        if row is None:
+            raise MemoryStorageError("Invitation space could not be read")
+        return cast(sqlite3.Row, row)
+
+    def list_invitations(
+        self, provider: str, session_id: str
+    ) -> list[SpaceInvitationInfo]:
+        with self._lock:
+            self._ensure_open()
+            self._get_session(self._connection, provider, session_id)
+            rows = self._connection.execute(
+                """
+                SELECT i.*, s.name, s.owner_session_id
+                FROM space_invitations AS i
+                JOIN spaces AS s ON s.id = i.space_id
+                WHERE i.invited_session_id = ? OR i.invited_by_session_id = ?
+                ORDER BY i.created_at DESC, i.id
+                """,
+                (session_id, session_id),
+            ).fetchall()
+            return [self._invitation_info(row) for row in rows]
+
+    def accept_invitation(
+        self, provider: str, session_id: str, invitation_id: str
+    ) -> SpaceInfo:
+        with self._transaction() as connection:
+            self._get_session(connection, provider, session_id)
+            invitation = connection.execute(
+                """
+                SELECT i.space_id, i.status, s.archived_at
+                FROM space_invitations AS i
+                JOIN spaces AS s ON s.id = i.space_id
+                WHERE i.id = ? AND i.invited_session_id = ?
+                """,
+                (invitation_id, session_id),
+            ).fetchone()
+            if invitation is None or invitation["archived_at"] is not None:
+                raise MemoryNotFoundError("Pending invitation not found")
+            space_id = str(invitation["space_id"])
+            if invitation["status"] == "accepted":
+                member = connection.execute(
+                    """
+                    SELECT 1 FROM space_memberships
+                    WHERE space_id = ? AND session_id = ?
+                    """,
+                    (space_id, session_id),
+                ).fetchone()
+                if member is None:
+                    raise MemoryNotFoundError("Pending invitation not found")
+                row = connection.execute(
+                    "SELECT * FROM spaces WHERE id = ?", (space_id,)
+                ).fetchone()
+                if row is None:
+                    raise MemoryStorageError("Accepted invitation space could not be read")
+                return self._space_info(connection, row)
+            if invitation["status"] != "pending":
+                raise MemoryNotFoundError("Pending invitation not found")
+            now = self._now()
+            connection.execute(
+                """
+                INSERT INTO space_memberships(
+                    space_id, session_id, role, added_by_session_id, created_at
+                ) VALUES (?, ?, 'member', ?, ?)
+                """,
+                (space_id, session_id, session_id, now),
+            )
+            connection.execute(
+                """
+                UPDATE space_invitations
+                SET status = 'accepted', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, invitation_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_membership_events(
+                    space_id, subject_session_id, actor_session_id, event, created_at
+                ) VALUES (?, ?, ?, 'accepted', ?)
+                """,
+                (space_id, session_id, session_id, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM spaces WHERE id = ?", (space_id,)
+            ).fetchone()
+            if row is None:
+                raise MemoryStorageError("Accepted invitation space could not be read")
+            return self._space_info(connection, row)
+
+    def revoke_membership(
+        self,
+        provider: str,
+        session_id: str,
+        space_id: str,
+        member_session_id: str,
+    ) -> None:
+        with self._transaction() as connection:
+            self._get_session(connection, provider, session_id)
+            space = connection.execute(
+                """
+                SELECT owner_session_id FROM spaces
+                WHERE id = ? AND space_type IN ('project', 'shared')
+                  AND owner_session_id = ? AND archived_at IS NULL
+                """,
+                (space_id, session_id),
+            ).fetchone()
+            if space is None:
+                raise MemoryNotFoundError("Shared space not found")
+            if member_session_id == session_id:
+                raise MemoryConflictError("The owner cannot revoke their own membership")
+            deleted = connection.execute(
+                "DELETE FROM space_memberships WHERE space_id = ? AND session_id = ?",
+                (space_id, member_session_id),
+            )
+            if deleted.rowcount != 1:
+                raise MemoryNotFoundError("Space membership not found")
+            now = self._now()
+            connection.execute(
+                """
+                UPDATE space_invitations SET status = 'revoked', updated_at = ?
+                WHERE space_id = ? AND invited_session_id = ? AND status = 'accepted'
+                """,
+                (now, space_id, member_session_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_membership_events(
+                    space_id, subject_session_id, actor_session_id, event, created_at
+                ) VALUES (?, ?, ?, 'revoked', ?)
+                """,
+                (space_id, member_session_id, session_id, now),
+            )
+
+    def leave_space(self, provider: str, session_id: str, space_id: str) -> None:
+        with self._transaction() as connection:
+            self._get_session(connection, provider, session_id)
+            space = connection.execute(
+                """
+                SELECT owner_session_id FROM spaces
+                WHERE id = ? AND space_type IN ('project', 'shared')
+                  AND archived_at IS NULL
+                """,
+                (space_id,),
+            ).fetchone()
+            if space is None:
+                raise MemoryNotFoundError("Shared space not found")
+            if space["owner_session_id"] == session_id:
+                raise MemoryConflictError("Space owner cannot leave their space")
+            deleted = connection.execute(
+                "DELETE FROM space_memberships WHERE space_id = ? AND session_id = ?",
+                (space_id, session_id),
+            )
+            if deleted.rowcount != 1:
+                raise MemoryNotFoundError("Space membership not found")
+            now = self._now()
+            connection.execute(
+                """
+                UPDATE space_invitations SET status = 'left', updated_at = ?
+                WHERE space_id = ? AND invited_session_id = ? AND status = 'accepted'
+                """,
+                (now, space_id, session_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO space_membership_events(
+                    space_id, subject_session_id, actor_session_id, event, created_at
+                ) VALUES (?, ?, ?, 'left', ?)
+                """,
+                (space_id, session_id, session_id, now),
+            )
+
+    def archive_space(self, provider: str, session_id: str, space_id: str) -> str:
+        with self._transaction() as connection:
+            self._get_session(connection, provider, session_id)
+            space = connection.execute(
+                """
+                SELECT * FROM spaces
+                WHERE id = ? AND space_type IN ('project', 'shared')
+                  AND owner_session_id = ?
+                """,
+                (space_id, session_id),
+            ).fetchone()
+            if space is None:
+                raise MemoryNotFoundError("Shared space not found")
+            if space["archived_at"] is not None:
+                return str(space["archived_at"])
+            now = self._now()
+            pending_invites = connection.execute(
+                """
+                SELECT invited_session_id FROM space_invitations
+                WHERE space_id = ? AND status = 'pending'
+                """,
+                (space_id,),
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE space_invitations SET status = 'revoked', updated_at = ?
+                WHERE space_id = ? AND status = 'pending'
+                """,
+                (now, space_id),
+            )
+            for invitation in pending_invites:
+                connection.execute(
+                    """
+                    INSERT INTO space_membership_events(
+                        space_id, subject_session_id, actor_session_id, event, created_at
+                    ) VALUES (?, ?, ?, 'revoked', ?)
+                    """,
+                    (space_id, invitation["invited_session_id"], session_id, now),
+                )
+            connection.execute(
+                "UPDATE spaces SET archived_at = ? WHERE id = ?", (now, space_id)
+            )
+            connection.execute(
+                """
+                INSERT INTO space_membership_events(
+                    space_id, subject_session_id, actor_session_id, event, created_at
+                ) VALUES (?, ?, ?, 'archived', ?)
+                """,
+                (space_id, session_id, session_id, now),
+            )
+            return now
+
     def _write_space(
         self,
         connection: sqlite3.Connection,
@@ -492,9 +1324,21 @@ class MemoryDatabase:
             "SELECT * FROM spaces WHERE id = ?",
             (space_id,),
         ).fetchone()
-        if row is None or row["provider"] != provider:
+        if row is None or row["archived_at"] is not None:
             raise MemoryAccessError("Write access to the requested space is not allowed")
-        if row["kind"] == "session" and row["owner_session_id"] != session["id"]:
+        if row["space_type"] == "provider":
+            if row["provider"] != provider:
+                raise MemoryAccessError("Write access to the requested space is not allowed")
+            return space_id
+        if row["space_type"] == "session":
+            if row["owner_session_id"] != session["id"]:
+                raise MemoryAccessError("Write access to the requested space is not allowed")
+            return space_id
+        member = connection.execute(
+            "SELECT 1 FROM space_memberships WHERE space_id = ? AND session_id = ?",
+            (space_id, session["id"]),
+        ).fetchone()
+        if member is None:
             raise MemoryAccessError("Write access to the requested space is not allowed")
         return space_id
 
@@ -1067,9 +1911,16 @@ class MemoryDatabase:
                   ON r.document_id = d.id AND r.revision = d.current_revision
                 JOIN spaces AS s ON s.id = d.space_id
                 WHERE d.id = ? AND {status_filter}
-                  AND s.kind IN ('provider', 'session')
+                  AND s.archived_at IS NULL
+                  AND (
+                    s.space_type IN ('provider', 'session')
+                    OR EXISTS (
+                        SELECT 1 FROM space_memberships AS m
+                        WHERE m.space_id = s.id AND m.session_id = ?
+                    )
+                  )
                 """,
-                (document_id,),
+                (document_id, session_id),
             ).fetchone()
             if row is None:
                 raise MemoryNotFoundError("Context record not found")
@@ -1099,7 +1950,7 @@ class MemoryDatabase:
                 JOIN document_revisions AS r
                   ON r.document_id = h.document_id AND r.revision = h.document_revision
                 JOIN spaces AS s ON s.id = d.space_id
-                WHERE h.session_id = ? AND h.task_id = ? AND s.kind = 'session'
+                WHERE h.session_id = ? AND h.task_id = ? AND s.space_type = 'session'
                 """,
                 (session_id, task_id),
             ).fetchone()
@@ -1188,13 +2039,20 @@ class MemoryDatabase:
                   ON r.document_id = c.document_id AND r.revision = c.revision
                 JOIN spaces AS s ON s.id = d.space_id
                 WHERE chunk_fts MATCH ? AND d.current_revision = c.revision
-                  AND {status_filter} AND s.kind IN ('provider', 'session')
+                  AND {status_filter} AND s.archived_at IS NULL
+                  AND (
+                    s.space_type IN ('provider', 'session')
+                    OR EXISTS (
+                        SELECT 1 FROM space_memberships AS m
+                        WHERE m.space_id = s.id AND m.session_id = ?
+                    )
+                  )
                   AND {where}
                 ORDER BY metric ASC, c.id ASC
                 LIMIT ?
             """
             rows = self._connection.execute(
-                sql, (match_query, *filters, limit * 20)
+                sql, (match_query, session_id, *filters, limit * 20)
             ).fetchall()
             return self._deduplicate_candidates(rows, limit)
 
@@ -1241,7 +2099,15 @@ class MemoryDatabase:
                       ON r.document_id = c.document_id AND r.revision = c.revision
                     JOIN spaces AS s ON s.id = d.space_id
                     WHERE d.current_revision = c.revision AND {status_filter}
-                      AND s.kind IN ('provider', 'session') AND {where}
+                      AND s.archived_at IS NULL
+                      AND (
+                        s.space_type IN ('provider', 'session')
+                        OR EXISTS (
+                            SELECT 1 FROM space_memberships AS m
+                            WHERE m.space_id = s.id AND m.session_id = ?
+                        )
+                      )
+                      AND {where}
                 ),
                 ranked AS (
                     SELECT *, ROW_NUMBER() OVER (
@@ -1254,7 +2120,9 @@ class MemoryDatabase:
                 ORDER BY metric ASC, document_id ASC
                 LIMIT ?
             """
-            rows = self._connection.execute(sql, (vector, *filters, limit)).fetchall()
+            rows = self._connection.execute(
+                sql, (vector, session_id, *filters, limit)
+            ).fetchall()
             return [self._search_candidate(row) for row in rows]
 
     @staticmethod

@@ -66,7 +66,17 @@ async def test_authenticated_streamable_http_tools() -> None:
         "echo",
         "register_session",
         "list_sessions",
+        "list_registered_sessions",
         "resume_session",
+        "create_space",
+        "list_spaces",
+        "get_space",
+        "list_invitations",
+        "invite_session",
+        "accept_invitation",
+        "revoke_membership",
+        "leave_space",
+        "archive_space",
         "put_context",
         "get_context",
         "search_context",
@@ -78,6 +88,10 @@ async def test_authenticated_streamable_http_tools() -> None:
         "whoami",
         "echo",
         "list_sessions",
+        "list_registered_sessions",
+        "list_spaces",
+        "get_space",
+        "list_invitations",
         "get_context",
         "search_context",
         "assemble_context",
@@ -229,6 +243,154 @@ async def test_mcp_memory_workflow_is_provider_bound_and_cross_provider_readable
                         "idempotency_key": "unauthorized-update",
                     },
                 )
+
+
+@pytest.mark.asyncio
+async def test_mcp_shared_space_invitation_and_revoke_flow(tmp_path) -> None:
+    codex_token = "codex-shared-test-token"
+    claude_token = "claude-shared-test-token"
+    data_dir = tmp_path / "shared-memory"
+    app_a = create_app(
+        Settings(
+            credentials=(
+                ProviderCredential("codex", hashlib.sha256(codex_token.encode()).hexdigest()),
+            ),
+            data_dir=data_dir,
+        ),
+        embedder=FakeEmbedder(),
+    )
+    app_b = create_app(
+        Settings(
+            credentials=(
+                ProviderCredential("claude", hashlib.sha256(claude_token.encode()).hexdigest()),
+            ),
+            data_dir=data_dir,
+        ),
+        embedder=FakeEmbedder(),
+    )
+
+    def transport_for(app, token: str) -> StreamableHttpTransport:
+        def httpx_client_factory(
+            headers: dict[str, str] | None = None,
+            timeout: httpx.Timeout | None = None,
+            auth: httpx.Auth | None = None,
+            follow_redirects: bool = True,
+        ) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:8000",
+                headers=headers,
+                timeout=timeout,
+                auth=auth,
+                follow_redirects=follow_redirects,
+            )
+
+        return StreamableHttpTransport(
+            "http://127.0.0.1:8000/mcp", auth=token, httpx_client_factory=httpx_client_factory
+        )
+
+    async with (
+        app_a.router.lifespan_context(app_a),
+        app_b.router.lifespan_context(app_b),
+        Client(transport_for(app_a, codex_token)) as owner_client,
+        Client(transport_for(app_b, claude_token)) as guest_client,
+    ):
+        owner = structured_data(
+            await owner_client.call_tool(
+                "register_session",
+                {"label": "Shared owner", "idempotency_key": "shared-owner-register"},
+            )
+        )
+        guest = structured_data(
+            await guest_client.call_tool(
+                "register_session",
+                {"label": "Shared guest", "idempotency_key": "shared-guest-register"},
+            )
+        )
+        space = structured_data(
+            await owner_client.call_tool(
+                "create_space",
+                {
+                    "session_id": owner["session_id"],
+                    "kind": "shared",
+                    "name": "MCP collaboration",
+                    "idempotency_key": "create-mcp-collaboration",
+                },
+            )
+        )
+        invitation = structured_data(
+            await owner_client.call_tool(
+                "invite_session",
+                {
+                    "session_id": owner["session_id"],
+                    "space_id": space["space_id"],
+                    "target_session_id": guest["session_id"],
+                },
+            )
+        )
+        listed_invitations = structured_data(
+            await guest_client.call_tool(
+                "list_invitations", {"session_id": guest["session_id"]}
+            )
+        )
+        assert listed_invitations["result"][0]["invitation_id"] == invitation["invitation_id"]
+        accepted = structured_data(
+            await guest_client.call_tool(
+                "accept_invitation",
+                {
+                    "session_id": guest["session_id"],
+                    "invitation_id": invitation["invitation_id"],
+                },
+            )
+        )
+        assert {member["session_id"] for member in accepted["members"]} == {
+            owner["session_id"],
+            guest["session_id"],
+        }
+        record = structured_data(
+            await guest_client.call_tool(
+                "put_context",
+                {
+                    "session_id": guest["session_id"],
+                    "space_id": space["space_id"],
+                    "title": "Shared MCP decision",
+                    "content": "The aurora deployment window is Friday.",
+                    "record_type": "decision",
+                    "idempotency_key": "shared-mcp-write",
+                },
+            )
+        )
+        found = structured_data(
+            await owner_client.call_tool(
+                "search_context",
+                {
+                    "session_id": owner["session_id"],
+                    "query": "aurora deployment Friday",
+                    "mode": "keyword",
+                },
+            )
+        )
+        assert found["results"][0]["document_id"] == record["document_id"]
+        await owner_client.call_tool(
+            "revoke_membership",
+            {
+                "session_id": owner["session_id"],
+                "space_id": space["space_id"],
+                "member_session_id": guest["session_id"],
+            },
+        )
+        hidden = structured_data(
+            await guest_client.call_tool(
+                "search_context",
+                {
+                    "session_id": guest["session_id"],
+                    "query": "aurora deployment Friday",
+                    "mode": "keyword",
+                    "space_ids": [space["space_id"]],
+                },
+            )
+        )
+        assert hidden["results"] == []
 
 
 @pytest.mark.asyncio

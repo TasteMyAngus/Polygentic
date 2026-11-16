@@ -137,6 +137,254 @@ async def test_cross_provider_search_is_readable_but_writes_remain_owned() -> No
 
 
 @pytest.mark.asyncio
+async def test_shared_space_invitation_and_exact_session_acl() -> None:
+    database, memory = _service()
+    try:
+        owner = await memory.register_session("codex", "Project owner", "register-owner")
+        sibling = await memory.register_session("codex", "Owner sibling", "register-sibling")
+        guest = await memory.register_session("claude", "Project guest", "register-guest")
+        project = await memory.create_space(
+            "codex", owner.session_id, "project", "Release project", "create-release-project"
+        )
+        assert project.kind == "project"
+        assert [(member.session_id, member.role) for member in project.members] == [
+            (owner.session_id, "owner")
+        ]
+        assert {
+            (session.session_id, session.provider)
+            for session in await memory.list_registered_sessions()
+        } == {
+            (owner.session_id, "codex"),
+            (sibling.session_id, "codex"),
+            (guest.session_id, "claude"),
+        }
+
+        assert await memory.list_spaces("codex", sibling.session_id) == []
+        with pytest.raises(MemoryNotFoundError, match="Project space not found"):
+            await memory.create_space(
+                "codex",
+                sibling.session_id,
+                "shared",
+                "Unlinked room",
+                "create-unlinked-room",
+                project_space_id=project.space_id,
+            )
+
+        project_invitation = await memory.invite_session(
+            "codex", owner.session_id, project.space_id, guest.session_id
+        )
+        await memory.accept_invitation(
+            "claude", guest.session_id, project_invitation.invitation_id
+        )
+        space = await memory.create_space(
+            "codex",
+            owner.session_id,
+            "shared",
+            "Release incident room",
+            "create-release-incident-room",
+            project_space_id=project.space_id,
+        )
+        replayed_space = await memory.create_space(
+            "codex",
+            owner.session_id,
+            "shared",
+            "Release incident room",
+            "create-release-incident-room",
+            project_space_id=project.space_id,
+        )
+        assert replayed_space.space_id == space.space_id
+        with pytest.raises(MemoryConflictError, match="Space creation idempotency key"):
+            await memory.create_space(
+                "codex",
+                owner.session_id,
+                "shared",
+                "Different room",
+                "create-release-incident-room",
+                project_space_id=project.space_id,
+            )
+        assert space.project_space_id == project.space_id
+        assert {
+            available.space_id
+            for available in await memory.list_spaces("claude", guest.session_id)
+        } == {project.space_id}
+        with pytest.raises(MemoryNotFoundError, match="Shared space not found"):
+            await memory.get_space("claude", guest.session_id, space.space_id)
+
+        invitation = await memory.invite_session(
+            "codex", owner.session_id, space.space_id, guest.session_id
+        )
+        replay = await memory.invite_session(
+            "codex", owner.session_id, space.space_id, guest.session_id
+        )
+        assert replay.invitation_id == invitation.invitation_id
+        assert replay.status == "pending"
+        assert (await memory.list_invitations("claude", guest.session_id))[0] == invitation
+        assert {
+            available.space_id
+            for available in await memory.list_spaces("claude", guest.session_id)
+        } == {project.space_id}
+
+        with pytest.raises(MemoryNotFoundError, match="Pending invitation"):
+            await memory.accept_invitation("codex", owner.session_id, invitation.invitation_id)
+
+        accepted = await memory.accept_invitation(
+            "claude", guest.session_id, invitation.invitation_id
+        )
+        accepted_replay = await memory.accept_invitation(
+            "claude", guest.session_id, invitation.invitation_id
+        )
+        assert {member.session_id for member in accepted.members} == {
+            owner.session_id,
+            guest.session_id,
+        }
+        assert accepted_replay == accepted
+        record = await memory.put_context(
+            provider="claude",
+            session_id=guest.session_id,
+            space_id=space.space_id,
+            title="Project milestone",
+            content="The orbital release milestone is scheduled for Friday.",
+            record_type="decision",
+            idempotency_key="shared-write",
+        )
+        owner_search = await memory.search_context(
+            provider="codex",
+            session_id=owner.session_id,
+            query="orbital release milestone",
+            mode="keyword",
+        )
+        assert owner_search.results[0].document_id == record.document_id
+
+        for mode in ("keyword", "semantic"):
+            hidden = await memory.search_context(
+                provider="codex",
+                session_id=sibling.session_id,
+                query="orbital release milestone",
+                mode=mode,
+            )
+            assert hidden.results == []
+            hidden_by_explicit_space = await memory.search_context(
+                provider="codex",
+                session_id=sibling.session_id,
+                query="orbital release milestone",
+                mode=mode,
+                space_ids=[space.space_id],
+            )
+            assert hidden_by_explicit_space.results == []
+        with pytest.raises(MemoryNotFoundError, match="Context record not found"):
+            await memory.get_context(
+                "codex", sibling.session_id, record.document_id, 0, 1000
+            )
+        with pytest.raises(MemoryAccessError, match="Write access"):
+            await memory.put_context(
+                provider="codex",
+                session_id=sibling.session_id,
+                space_id=space.space_id,
+                title="Sibling write",
+                content="Provider identity does not grant shared-space membership.",
+                record_type="note",
+                idempotency_key="sibling-shared-write",
+            )
+        with pytest.raises(MemoryNotFoundError, match="Shared space not found"):
+            await memory.invite_session(
+                "claude", guest.session_id, space.space_id, sibling.session_id
+            )
+
+        await memory.revoke_membership(
+            "codex", owner.session_id, space.space_id, guest.session_id
+        )
+        assert (await memory.list_invitations("claude", guest.session_id))[0].status == "revoked"
+        assert [member.session_id for member in (await memory.get_space(
+            "codex", owner.session_id, space.space_id
+        )).members] == [owner.session_id]
+        with pytest.raises(MemoryNotFoundError, match="Context record not found"):
+            await memory.get_context(
+                "claude", guest.session_id, record.document_id, 0, 1000
+            )
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_space_leave_owner_rules_and_archive() -> None:
+    database, memory = _service()
+    try:
+        owner = await memory.register_session("codex", "Space owner", "register-space-owner")
+        member = await memory.register_session("claude", "Space member", "register-space-member")
+        pending = await memory.register_session(
+            "copilot", "Pending invitee", "register-pending-invitee"
+        )
+        space = await memory.create_space(
+            "codex",
+            owner.session_id,
+            "shared",
+            "Incident response",
+            "create-incident-response",
+        )
+        invitation = await memory.invite_session(
+            "codex", owner.session_id, space.space_id, member.session_id
+        )
+        await memory.accept_invitation("claude", member.session_id, invitation.invitation_id)
+
+        with pytest.raises(MemoryConflictError, match="owner cannot leave"):
+            await memory.leave_space("codex", owner.session_id, space.space_id)
+        await memory.leave_space("claude", member.session_id, space.space_id)
+        assert (await memory.list_invitations("claude", member.session_id))[0].status == "left"
+        with pytest.raises(MemoryNotFoundError, match="Shared space not found"):
+            await memory.get_space("claude", member.session_id, space.space_id)
+
+        archived_record = await memory.put_context(
+            provider="codex",
+            session_id=owner.session_id,
+            space_id=space.space_id,
+            title="Incident runbook",
+            content="The glacier incident response starts with the control-plane checklist.",
+            record_type="constraint",
+            idempotency_key="archive-record",
+        )
+        pending_invitation = await memory.invite_session(
+            "codex", owner.session_id, space.space_id, pending.session_id
+        )
+        archived_at = await memory.archive_space("codex", owner.session_id, space.space_id)
+        assert archived_at
+        assert (await memory.list_invitations("copilot", pending.session_id))[0].status == "revoked"
+        with pytest.raises(MemoryNotFoundError, match="Pending invitation"):
+            await memory.accept_invitation(
+                "copilot", pending.session_id, pending_invitation.invitation_id
+            )
+        archived = await memory.get_space("codex", owner.session_id, space.space_id)
+        assert archived.archived_at == archived_at
+        assert await memory.archive_space("codex", owner.session_id, space.space_id) == archived_at
+        archived_search = await memory.search_context(
+            provider="codex",
+            session_id=owner.session_id,
+            query="glacier incident control-plane",
+            mode="keyword",
+        )
+        assert all(hit.document_id != archived_record.document_id for hit in archived_search.results)
+        with pytest.raises(MemoryNotFoundError, match="Context record not found"):
+            await memory.get_context(
+                "codex", owner.session_id, archived_record.document_id, 0, 1000
+            )
+        with pytest.raises(MemoryNotFoundError, match="Shared space not found"):
+            await memory.invite_session(
+                "codex", owner.session_id, space.space_id, member.session_id
+            )
+        with pytest.raises(MemoryAccessError, match="Write access"):
+            await memory.put_context(
+                provider="codex",
+                session_id=owner.session_id,
+                space_id=space.space_id,
+                title="Archived write",
+                content="Archived spaces reject new writes.",
+                record_type="note",
+                idempotency_key="archived-write",
+            )
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
 async def test_supersession_is_idempotent_and_history_is_opt_in() -> None:
     database, memory = _service()
     try:
@@ -485,12 +733,26 @@ async def test_persistent_store_reopens_with_sessions_and_vectors(tmp_path: Path
         second_database.close()
 
 
-def test_schema_v1_migrates_to_supersession_schema_v2(tmp_path: Path) -> None:
+def test_schema_v1_migrates_to_shared_space_schema_v3(tmp_path: Path) -> None:
     data_dir = tmp_path / "legacy-memory"
     initial = MemoryDatabase(data_dir)
+    initial.register_session("codex", "Legacy session", "legacy-registration")
     initial.close()
 
     connection = sqlite3.connect(data_dir / "context.sqlite3")
+    connection.execute("DROP TABLE space_membership_events")
+    connection.execute("DROP TABLE space_invitations")
+    connection.execute("DROP TABLE space_memberships")
+    connection.execute("DROP TABLE space_creation_requests")
+    connection.execute("DROP INDEX session_space_owner")
+    connection.execute("ALTER TABLE spaces DROP COLUMN archived_at")
+    connection.execute("ALTER TABLE spaces DROP COLUMN name")
+    connection.execute("ALTER TABLE spaces DROP COLUMN project_space_id")
+    connection.execute("ALTER TABLE spaces DROP COLUMN space_type")
+    connection.execute(
+        "CREATE UNIQUE INDEX session_space_owner "
+        "ON spaces(owner_session_id) WHERE kind = 'session'"
+    )
     connection.execute("DROP TABLE supersession_requests")
     connection.execute("DROP TABLE document_status_events")
     connection.execute("DROP TABLE supersession_edges")
@@ -507,11 +769,20 @@ def test_schema_v1_migrates_to_supersession_schema_v2(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert version == 2
+        assert version == 3
         assert {
             "supersession_edges",
             "document_status_events",
             "supersession_requests",
+            "space_memberships",
+            "space_invitations",
+            "space_membership_events",
+            "space_creation_requests",
         } <= tables
+        space_types = {
+            row["space_type"]
+            for row in migrated._connection.execute("SELECT space_type FROM spaces")
+        }
+        assert space_types == {"provider", "session"}
     finally:
         migrated.close()

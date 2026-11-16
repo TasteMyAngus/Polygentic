@@ -17,6 +17,8 @@ from context_server.storage import (
     RecordSnapshot,
     SearchCandidate,
     SessionInfo,
+    SpaceInfo,
+    SpaceInvitationInfo,
     SupersessionReceipt,
     WriteReceipt,
 )
@@ -32,6 +34,7 @@ type RecordType = Literal[
     "handoff",
 ]
 type SearchMode = Literal["hybrid", "keyword", "semantic"]
+type SharedSpaceKind = Literal["project", "shared"]
 type MetadataValue = str | int | float | bool | None
 type Metadata = dict[str, MetadataValue]
 
@@ -131,6 +134,39 @@ class SupersessionResult(BaseModel):
     superseded_document_ids: list[str]
 
 
+class RegisteredSessionResult(BaseModel):
+    session_id: str
+    provider: str
+
+
+class SpaceMemberResult(BaseModel):
+    session_id: str
+    provider: str
+    role: Literal["owner", "member"]
+
+
+class SpaceResult(BaseModel):
+    space_id: str
+    kind: SharedSpaceKind
+    name: str
+    project_space_id: str | None
+    owner_session_id: str
+    owner_provider: str
+    archived_at: str | None
+    members: list[SpaceMemberResult]
+
+
+class SpaceInvitationResult(BaseModel):
+    invitation_id: str
+    space_id: str
+    space_name: str
+    owner_session_id: str
+    inviter_session_id: str
+    invited_session_id: str
+    status: Literal["pending", "accepted", "revoked", "left"]
+    created_at: str
+
+
 class AssembledCheckpoint(BaseModel):
     document_id: str
     document_revision: int
@@ -175,6 +211,127 @@ class MemoryService:
             self._database.resume_session, provider, session_id
         )
         return _session_result(session)
+
+    async def list_registered_sessions(self) -> list[RegisteredSessionResult]:
+        sessions = await asyncio.to_thread(self._database.list_registered_sessions)
+        return [
+            RegisteredSessionResult(session_id=session.session_id, provider=session.provider)
+            for session in sessions
+        ]
+
+    async def create_space(
+        self,
+        provider: str,
+        session_id: str,
+        kind: SharedSpaceKind,
+        name: str,
+        idempotency_key: str,
+        project_space_id: str | None = None,
+    ) -> SpaceResult:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(idempotency_key, "idempotency key")
+        if kind not in {"project", "shared"}:
+            raise ValueError("kind must be project or shared")
+        _validate_bounded_text(name, MAX_TITLE_CHARACTERS, "space name")
+        if project_space_id is not None:
+            _validate_identifier(project_space_id, "project space ID")
+        payload_hash = _payload_hash(
+            {
+                "operation": "create_space",
+                "session_id": session_id,
+                "kind": kind,
+                "name": name,
+                "project_space_id": project_space_id,
+            }
+        )
+        space = await asyncio.to_thread(
+            self._database.create_space,
+            provider,
+            session_id,
+            kind,
+            name,
+            idempotency_key,
+            payload_hash,
+            project_space_id,
+        )
+        return _space_result(space)
+
+    async def list_spaces(self, provider: str, session_id: str) -> list[SpaceResult]:
+        _validate_identifier(session_id, "session ID")
+        spaces = await asyncio.to_thread(self._database.list_spaces, provider, session_id)
+        return [_space_result(space) for space in spaces]
+
+    async def get_space(
+        self, provider: str, session_id: str, space_id: str
+    ) -> SpaceResult:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(space_id, "space ID")
+        space = await asyncio.to_thread(
+            self._database.get_space, provider, session_id, space_id
+        )
+        return _space_result(space)
+
+    async def invite_session(
+        self, provider: str, session_id: str, space_id: str, target_session_id: str
+    ) -> SpaceInvitationResult:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(space_id, "space ID")
+        _validate_identifier(target_session_id, "target session ID")
+        invitation = await asyncio.to_thread(
+            self._database.invite_session,
+            provider,
+            session_id,
+            space_id,
+            target_session_id,
+        )
+        return _invitation_result(invitation)
+
+    async def list_invitations(
+        self, provider: str, session_id: str
+    ) -> list[SpaceInvitationResult]:
+        _validate_identifier(session_id, "session ID")
+        invitations = await asyncio.to_thread(
+            self._database.list_invitations, provider, session_id
+        )
+        return [_invitation_result(invitation) for invitation in invitations]
+
+    async def accept_invitation(
+        self, provider: str, session_id: str, invitation_id: str
+    ) -> SpaceResult:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(invitation_id, "invitation ID")
+        space = await asyncio.to_thread(
+            self._database.accept_invitation, provider, session_id, invitation_id
+        )
+        return _space_result(space)
+
+    async def revoke_membership(
+        self, provider: str, session_id: str, space_id: str, member_session_id: str
+    ) -> None:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(space_id, "space ID")
+        _validate_identifier(member_session_id, "member session ID")
+        await asyncio.to_thread(
+            self._database.revoke_membership,
+            provider,
+            session_id,
+            space_id,
+            member_session_id,
+        )
+
+    async def leave_space(self, provider: str, session_id: str, space_id: str) -> None:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(space_id, "space ID")
+        await asyncio.to_thread(self._database.leave_space, provider, session_id, space_id)
+
+    async def archive_space(
+        self, provider: str, session_id: str, space_id: str
+    ) -> str:
+        _validate_identifier(session_id, "session ID")
+        _validate_identifier(space_id, "space ID")
+        return await asyncio.to_thread(
+            self._database.archive_space, provider, session_id, space_id
+        )
 
     async def put_context(
         self,
@@ -502,6 +659,39 @@ def _session_result(session: SessionInfo) -> SessionResult:
         session_space_id=session.session_space_id,
         created_at=session.created_at,
         last_seen_at=session.last_seen_at,
+    )
+
+
+def _space_result(space: SpaceInfo) -> SpaceResult:
+    return SpaceResult(
+        space_id=space.space_id,
+        kind=space.kind,  # type: ignore[arg-type]
+        name=space.name,
+        project_space_id=space.project_space_id,
+        owner_session_id=space.owner_session_id,
+        owner_provider=space.owner_provider,
+        archived_at=space.archived_at,
+        members=[
+            SpaceMemberResult(
+                session_id=member.session_id,
+                provider=member.provider,
+                role=member.role,  # type: ignore[arg-type]
+            )
+            for member in space.members
+        ],
+    )
+
+
+def _invitation_result(invitation: SpaceInvitationInfo) -> SpaceInvitationResult:
+    return SpaceInvitationResult(
+        invitation_id=invitation.invitation_id,
+        space_id=invitation.space_id,
+        space_name=invitation.space_name,
+        owner_session_id=invitation.owner_session_id,
+        inviter_session_id=invitation.inviter_session_id,
+        invited_session_id=invitation.invited_session_id,
+        status=invitation.status,  # type: ignore[arg-type]
+        created_at=invitation.created_at,
     )
 
 

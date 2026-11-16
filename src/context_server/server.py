@@ -22,9 +22,13 @@ from context_server.memory import (
     MemoryService,
     Metadata,
     RecordType,
+    RegisteredSessionResult,
     SearchMode,
     SearchResponse,
     SessionResult,
+    SharedSpaceKind,
+    SpaceInvitationResult,
+    SpaceResult,
     SupersessionResult,
 )
 from context_server.middleware import RequestBoundaryMiddleware
@@ -61,6 +65,12 @@ def create_app(
     write_operation = ToolAnnotations(
         readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
     )
+    idempotent_write_operation = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    )
+    destructive_operation = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+    )
 
     def authenticated_provider() -> str:
         access_token = get_access_token()
@@ -95,10 +105,90 @@ def create_app(
         """List logical sessions owned by the authenticated provider."""
         return await memory.list_sessions(authenticated_provider())
 
+    @mcp.tool(annotations=read_only)
+    async def list_registered_sessions() -> list[RegisteredSessionResult]:
+        """List registered session IDs and providers for exact-session invitations."""
+        return await memory.list_registered_sessions()
+
     @mcp.tool(annotations=write_operation)
     async def resume_session(session_id: str) -> SessionResult:
         """Resume a logical session owned by the authenticated provider."""
         return await memory.resume_session(authenticated_provider(), session_id)
+
+    @mcp.tool(annotations=idempotent_write_operation)
+    async def create_space(
+        session_id: str,
+        kind: SharedSpaceKind,
+        name: str,
+        idempotency_key: str,
+        project_space_id: str | None = None,
+    ) -> SpaceResult:
+        """Create a project or ad-hoc space; linking a project grants no inherited access."""
+        return await memory.create_space(
+            authenticated_provider(),
+            session_id,
+            kind,
+            name,
+            idempotency_key,
+            project_space_id,
+        )
+
+    @mcp.tool(annotations=read_only)
+    async def list_spaces(session_id: str) -> list[SpaceResult]:
+        """List shared spaces readable by this exact session."""
+        return await memory.list_spaces(authenticated_provider(), session_id)
+
+    @mcp.tool(annotations=read_only)
+    async def get_space(session_id: str, space_id: str) -> SpaceResult:
+        """Read a shared space and its exact-session membership list."""
+        return await memory.get_space(authenticated_provider(), session_id, space_id)
+
+    @mcp.tool(annotations=read_only)
+    async def list_invitations(session_id: str) -> list[SpaceInvitationResult]:
+        """List invitations addressed to or issued by this exact session."""
+        return await memory.list_invitations(authenticated_provider(), session_id)
+
+    @mcp.tool(annotations=write_operation)
+    async def invite_session(
+        session_id: str, space_id: str, target_session_id: str
+    ) -> SpaceInvitationResult:
+        """Invite one registered session to a space owned by this exact session."""
+        return await memory.invite_session(
+            authenticated_provider(), session_id, space_id, target_session_id
+        )
+
+    @mcp.tool(annotations=write_operation)
+    async def accept_invitation(session_id: str, invitation_id: str) -> SpaceResult:
+        """Accept a pending invitation addressed to this exact session."""
+        return await memory.accept_invitation(
+            authenticated_provider(), session_id, invitation_id
+        )
+
+    @mcp.tool(annotations=destructive_operation)
+    async def revoke_membership(
+        session_id: str, space_id: str, member_session_id: str
+    ) -> dict[str, bool]:
+        """Revoke one exact session's membership; only the space owner may do so."""
+        await memory.revoke_membership(
+            authenticated_provider(), session_id, space_id, member_session_id
+        )
+        return {"revoked": True}
+
+    @mcp.tool(annotations=destructive_operation)
+    async def leave_space(session_id: str, space_id: str) -> dict[str, bool]:
+        """Leave a shared space; its owner must archive or transfer it instead."""
+        await memory.leave_space(authenticated_provider(), session_id, space_id)
+        return {"left": True}
+
+    @mcp.tool(annotations=destructive_operation)
+    async def archive_space(
+        session_id: str, space_id: str
+    ) -> dict[str, str]:
+        """Archive a space owned by this exact session and block future access."""
+        archived_at = await memory.archive_space(
+            authenticated_provider(), session_id, space_id
+        )
+        return {"space_id": space_id, "archived_at": archived_at}
 
     @mcp.tool(annotations=write_operation)
     async def put_context(

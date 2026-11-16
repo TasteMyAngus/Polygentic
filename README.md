@@ -117,15 +117,18 @@ arguments. `echo` accepts at most 2,048 characters.
 
 ## Persistent memory (Milestone 1 in progress)
 
-The MCP tools are `register_session`, `list_sessions`, `resume_session`, `put_context`,
-`get_context`, `search_context`, `supersede_context`, `put_checkpoint`, and
-`assemble_context`, in addition to `whoami` and `echo`. Records are typed as notes,
-decisions, constraints, findings, unresolved items, lessons, checkpoints, or handoffs.
-Writes use idempotency keys and revision checks; retrieval supports keyword, semantic, or
-hybrid search, with hybrid as the default. Supersession is explicit and same-space only;
-default searches hide superseded records, while history can be requested explicitly.
-Checkpoint heads are revisioned per logical session and task, and context assembly returns
-the exact checkpoint with bounded supporting evidence.
+The MCP tools include `register_session`, `list_sessions`, `list_registered_sessions`,
+`resume_session`, `create_space`, `list_spaces`, `get_space`, `invite_session`,
+`list_invitations`, `accept_invitation`, `revoke_membership`, `leave_space`,
+`archive_space`, `put_context`, `get_context`, `search_context`, `supersede_context`,
+`put_checkpoint`, and `assemble_context`, in addition to `whoami` and `echo`. Records are
+typed as notes, decisions, constraints, findings, unresolved items, lessons, checkpoints,
+or handoffs. Context writes and space creation use idempotency keys, and record updates use
+revision checks. Retrieval supports keyword, semantic, or hybrid search, with hybrid as the
+default. Supersession is explicit and same-space only; default searches hide superseded
+records, while history can be requested explicitly. Checkpoint heads are revisioned per
+logical session and task, and context assembly returns the exact checkpoint with bounded
+supporting evidence.
 See the [client session workflow](docs/client-workflow.md) for local state management,
 recovery, and checkpoint guidance.
 
@@ -137,12 +140,30 @@ data/cache directories. Override them with `CONTEXT_SERVER_DATA_DIR` and
 the service account. Retrieved context is still sent to the connected provider when used;
 local embeddings do not mean retrieved text stays on the Mac.
 
+Create an owner-only, SQLite-consistent backup with `context-backup /path/to/backup.sqlite3`.
+The command uses the configured `CONTEXT_SERVER_DATA_DIR` (or the default application data
+directory); pass `--data-dir` to select another database. Existing backups are not replaced
+unless `--overwrite` is specified. Restore with
+`context-restore /path/to/backup.sqlite3 [--data-dir /path/to/data] --overwrite` when the
+destination database already exists. Stop all server processes before restoring. Restore
+validates and stages the backup before replacing the database. These commands cover the
+SQLite memory database only, not credentials, OAuth state, or the model cache.
+
 Authenticated providers can read all provider and session spaces. A provider can write its
-own provider space, and a session can write its own session space. Session IDs are
-server-generated and provider-bound, but clients sharing one provider credential can claim
-another session owned by that same provider; logical sessions are not a strict security
-boundary from one another. Supersession is limited to records in the same space. This slice
-does not yet implement membership-restricted shared spaces or tombstones.
+own provider space, and a session can write its own session space. Project and ad-hoc
+shared spaces are visible only to their owner and exact accepted member sessions; sharing a
+provider credential does not grant a sibling session membership. Space owners invite
+registered session IDs, and the invited session must accept. Only the owner can manage
+membership or archive the space; owners cannot leave their own spaces. Revocation and
+archiving immediately remove access from future reads, searches, and writes while retaining
+stored records. An ad-hoc shared space may reference a project, but the link does not
+inherit project membership or access.
+
+Session IDs are server-generated and provider-bound, but clients sharing one provider
+credential can claim another session owned by that same provider; logical sessions are not
+a strict security boundary from one another. `list_registered_sessions` exposes only
+session IDs and provider names to support exact-session invitations. Supersession is limited
+to records in the same space. Record tombstones are not implemented.
 
 ### Retrieval evaluation
 
@@ -199,7 +220,7 @@ mapping. Revoking the GitHub OAuth app grant itself remains a separate action in
 
 ## Gate 0 status
 
-On macOS, all 64 automated tests pass, including the initial memory service, configuration,
+On macOS, all 67 automated tests pass, including the initial memory service, configuration,
 and MCP cross-provider workflow tests. A local server process has completed synthetic
 authenticated MCP round trips with Codex, Claude, and Copilot provider credentials.
 Missing/invalid credentials and unexpected Host/Origin headers were rejected. The real

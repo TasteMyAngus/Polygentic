@@ -6,14 +6,20 @@ An authenticated MCP context server for sharing persistent context between agent
 
 ## Current milestone
 
-This repository currently contains only the Gate 0 connectivity spike: an authenticated
-Streamable HTTP MCP server with `whoami` and bounded `echo` tools. It does not yet store
-context, create sessions, or provide vector search.
+The initial persistent-memory slice is implemented: authenticated logical sessions,
+revisioned text records, local embeddings, hybrid retrieval, typed task checkpoints, and
+bounded context assembly. The real embedding model has passed a local retrieval smoke test;
+the full client restart workflow still needs validation. Shared/project spaces, client-local
+recovery instructions, and production deployment are not implemented.
+
+The user provisionally accepted Gate 0 for proceeding on 2026-11-16, with the
+client-compatibility gaps documented below; this is not approval for public exposure or
+production deployment.
 
 The service binds to loopback by default. Do not expose it through Tailscale Funnel or any
-other public endpoint until the authentication, client-compatibility, and deployment gates
-are complete. A bearer token is a secret; configure clients to supply it as an authorization
-header and never put it in a repository or agent-visible instructions.
+other public endpoint until production deployment and exposure checks are complete. A
+bearer token is a secret; configure clients to supply it as an authorization header and
+never put it in a repository or agent-visible instructions.
 
 ## Local development
 
@@ -108,6 +114,31 @@ The server refuses to start without configured provider credentials. `whoami` re
 provider bound to the verified credential; callers cannot select a provider through tool
 arguments. `echo` accepts at most 2,048 characters.
 
+## Persistent memory (Milestone 1 in progress)
+
+The MCP tools are `register_session`, `list_sessions`, `resume_session`, `put_context`,
+`get_context`, `search_context`, `put_checkpoint`, and `assemble_context`, in addition to
+`whoami` and `echo`. Records are typed as notes, decisions, constraints, findings,
+unresolved items, lessons, checkpoints, or handoffs. Writes use idempotency keys and
+revision checks; retrieval supports keyword, semantic, or hybrid search, with hybrid as the
+default. Checkpoint heads are revisioned per logical session and task, and context assembly
+returns the exact checkpoint with bounded supporting evidence.
+
+SQLite stores records, FTS5 indexes, and sqlite-vec vectors locally. The first memory write
+or semantic/hybrid search initializes FastEmbed and may download `BAAI/bge-small-en-v1.5`;
+afterward inference is local. Defaults use the operating system's Polygentic application
+data/cache directories. Override them with `CONTEXT_SERVER_DATA_DIR` and
+`CONTEXT_SERVER_MODEL_CACHE_DIR`. Data and model caches are intended to remain private to
+the service account. Retrieved context is still sent to the connected provider when used;
+local embeddings do not mean retrieved text stays on the Mac.
+
+Authenticated providers can read all provider and session spaces. A provider can write its
+own provider space, and a session can write its own session space. Session IDs are
+server-generated and provider-bound, but clients sharing one provider credential can claim
+another session owned by that same provider; logical sessions are not a strict security
+boundary from one another. This slice does not yet implement membership-restricted shared
+spaces, supersession, or tombstones.
+
 ### Local GitHub OAuth spike
 
 The optional OAuth mode binds an OAuth login for the configured GitHub account to the
@@ -115,9 +146,10 @@ The optional OAuth mode binds an OAuth login for the configured GitHub account t
 administrator can select another provider at startup with
 `CONTEXT_SERVER_GITHUB_PROVIDER`. This binding applies to every OAuth login in that
 server instance; the caller cannot select its own provider. FastMCP stores OAuth state
-and tokens in its encrypted file-backed store by default; restart recovery still needs
-deployment-level verification. This test setup is not approved for persistent public
-exposure or production deployment.
+and tokens in its encrypted file-backed store by default. A synthetic OAuth registration
+and consent transaction survived an actual loopback server-process restart using a
+temporary data home; production state-path and key recovery remain unverified. This test
+setup is not approved for persistent public exposure or production deployment.
 
 Create a GitHub OAuth app with callback `http://localhost:8000/auth/callback`, and store
 its client secret in an owner-only file outside the repository. With the bearer
@@ -146,9 +178,12 @@ mapping. Revoking the GitHub OAuth app grant itself remains a separate action in
 
 ## Gate 0 status
 
-On macOS, all 48 automated tests pass and a local server process has completed synthetic
+On macOS, all 56 automated tests pass, including the initial memory service, configuration,
+and MCP cross-provider workflow tests. A local server process has completed synthetic
 authenticated MCP round trips with Codex, Claude, and Copilot provider credentials.
-Missing/invalid credentials and unexpected Host/Origin headers were rejected.
+Missing/invalid credentials and unexpected Host/Origin headers were rejected. The real
+FastEmbed model loaded locally and returned 384-dimensional embeddings; a real-model hybrid
+retrieval smoke test returned the expected record.
 
 FastMCP was upgraded from 2.14.7 to 3.4.11, which includes the fix for
 [GHSA-rww4-4w9c-7733](https://github.com/advisories/GHSA-rww4-4w9c-7733).
@@ -163,9 +198,11 @@ connector.
 | Client | Local Streamable HTTP result | Authentication |
 |---|---|---|
 | Codex CLI 0.169.0 | Discovered and called `whoami` and `echo`; `whoami` returned `codex` on FastMCP 3.4.11 | Bearer token from environment |
+| Codex desktop | Not tested; user assumes compatibility based on the CLI result | Not verified |
 | Claude Code 2.1.311 | Discovered and called `whoami` and `echo`; `whoami` returned `claude` on FastMCP 3.4.11 | Bearer header from environment |
-| VS Code Copilot | Discovered and called `whoami` and `echo`; `whoami` returned `copilot` on FastMCP 3.4.11 | Temporary bearer token in owner-only Copilot user config |
+| VS Code Copilot | Discovered and called `whoami` and `echo`; `whoami` returned `copilot` on FastMCP 3.4.11 | Temporary bearer header in owner-only workspace MCP config |
 | Claude.ai hosted connector | Discovered, completed OAuth, and called `whoami` (`claude`) and `echo` (`hosted test`, length 11) over HTTPS | GitHub OAuth through a temporary Tailscale Funnel route |
+| GitHub Copilot cloud agent | Deferred; not tested because the account is on Copilot Free | Not verified |
 
 These were isolated synthetic tests with temporary credentials. The Codex test enabled
 automatic approval only for the test server's read-only tools. The tools advertise
@@ -173,9 +210,11 @@ read-only annotations; those hints are not an authorization boundary.
 
 The Claude hosted-connector test used synthetic echo text and a temporary Funnel route.
 The route was reset and the server stopped after the test; no public server is currently
-exposed. Not yet verified: GitHub Copilot cloud agent, production Mac mini deployment,
-upstream GitHub grant revocation, and persistent external operation. FastMCP's encrypted storage is
-configured and transaction recovery is covered by a test, but deployment-level restart
-recovery remains unverified. Request-size and process-wide rate limits are implemented,
-but they are not a substitute for upstream DDoS protection. Do not enable persistent
-public access until the remaining checks pass.
+exposed. On 2026-11-16, the user accepted Gate 0 provisionally for continued development.
+This records a scope decision, not a pass for the unverified Codex desktop client or
+deferred GitHub Copilot cloud agent. Production Mac mini deployment, upstream GitHub grant
+revocation, production state/key recovery, launchd recovery, and persistent external
+operation remain unverified. The local process-restart check used only synthetic data and
+stopped before OAuth approval or any upstream GitHub request. Request-size and process-wide
+rate limits are implemented, but they are not a substitute for upstream DDoS protection.
+Do not enable persistent public access until the remaining deployment checks pass.

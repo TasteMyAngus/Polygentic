@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from platformdirs import user_cache_path, user_data_path
+
 _PROVIDER_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 _SHA256 = re.compile(r"^[a-fA-F0-9]{64}$")
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -42,6 +44,8 @@ class Settings:
     allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
     allowed_origins: tuple[str, ...] = ()
     local_github_oauth: LocalGitHubOAuth | None = None
+    data_dir: Path | None = None
+    model_cache_dir: Path | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -74,6 +78,18 @@ class Settings:
         oauth = _load_local_github_oauth()
         if oauth is not None and host != "127.0.0.1":
             raise ConfigurationError("Local GitHub OAuth requires the 127.0.0.1 bind address")
+        data_dir = Path(
+            os.environ.get(
+                "CONTEXT_SERVER_DATA_DIR",
+                str(user_data_path("Polygentic", appauthor=False)),
+            )
+        ).expanduser()
+        model_cache_dir = Path(
+            os.environ.get(
+                "CONTEXT_SERVER_MODEL_CACHE_DIR",
+                str(user_cache_path("Polygentic", appauthor=False) / "models"),
+            )
+        ).expanduser()
 
         return cls(
             credentials=credentials,
@@ -82,6 +98,8 @@ class Settings:
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
             local_github_oauth=oauth,
+            data_dir=data_dir,
+            model_cache_dir=model_cache_dir,
         )
 
 

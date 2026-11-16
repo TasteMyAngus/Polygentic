@@ -9,7 +9,10 @@ description = "Authenticated MCP context server"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "fastembed>=0.7,<1",
     "fastmcp==3.4.11",
+    "platformdirs>=4,<5",
+    "sqlite-vec>=0.1.6,<1",
 ]
 
 [project.optional-dependencies]

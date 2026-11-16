@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Sequence
 
 import httpx
 import pytest
@@ -11,6 +12,16 @@ from key_value.aio.stores.memory import MemoryStore
 
 from context_server.config import LocalGitHubOAuth, ProviderCredential, Settings
 from context_server.server import create_app
+
+
+class FakeEmbedder:
+    async def embed(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
+        return [tuple([1.0] + [0.0] * 383) for _ in texts]
+
+
+def structured_data(result) -> dict:
+    assert result.structured_content is not None
+    return result.structured_content
 
 
 @pytest.mark.asyncio
@@ -49,13 +60,136 @@ async def test_authenticated_streamable_http_tools() -> None:
 
     assert identity.data == {"provider": "codex"}
     assert echoed.data == {"text": "synthetic smoke test", "length": 20}
-    assert {tool.name for tool in listed} == {"whoami", "echo"}
+    tools = {tool.name: tool for tool in listed}
+    assert set(tools) == {
+        "whoami",
+        "echo",
+        "register_session",
+        "list_sessions",
+        "resume_session",
+        "put_context",
+        "get_context",
+        "search_context",
+        "put_checkpoint",
+        "assemble_context",
+    }
+    read_only_tools = {
+        "whoami",
+        "echo",
+        "list_sessions",
+        "get_context",
+        "search_context",
+        "assemble_context",
+    }
     assert all(
-        tool.annotations is not None
-        and tool.annotations.readOnlyHint is True
-        and tool.annotations.destructiveHint is False
-        for tool in listed
+        tools[name].annotations is not None
+        and tools[name].annotations.readOnlyHint is True
+        and tools[name].annotations.destructiveHint is False
+        for name in read_only_tools
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_memory_workflow_is_provider_bound_and_cross_provider_readable(
+    tmp_path,
+) -> None:
+    codex_token = "codex-memory-test-token"
+    claude_token = "claude-memory-test-token"
+    data_dir = tmp_path / "memory"
+    app_a = create_app(
+        Settings(
+            credentials=(
+                ProviderCredential("codex", hashlib.sha256(codex_token.encode()).hexdigest()),
+            ),
+            data_dir=data_dir,
+        ),
+        embedder=FakeEmbedder(),
+    )
+    app_b = create_app(
+        Settings(
+            credentials=(
+                ProviderCredential("claude", hashlib.sha256(claude_token.encode()).hexdigest()),
+            ),
+            data_dir=data_dir,
+        ),
+        embedder=FakeEmbedder(),
+    )
+
+    def transport_for(app, token: str) -> StreamableHttpTransport:
+        def httpx_client_factory(
+            headers: dict[str, str] | None = None,
+            timeout: httpx.Timeout | None = None,
+            auth: httpx.Auth | None = None,
+            follow_redirects: bool = True,
+        ) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:8000",
+                headers=headers,
+                timeout=timeout,
+                auth=auth,
+                follow_redirects=follow_redirects,
+            )
+
+        return StreamableHttpTransport(
+            "http://127.0.0.1:8000/mcp",
+            auth=token,
+            httpx_client_factory=httpx_client_factory,
+        )
+
+    async with app_a.router.lifespan_context(app_a), Client(
+        transport_for(app_a, codex_token)
+    ) as client_a:
+        registration = await client_a.call_tool(
+            "register_session",
+            {"label": "Decision writer", "idempotency_key": "register-codex"},
+        )
+        session_a = structured_data(registration)["session_id"]
+        written = await client_a.call_tool(
+            "put_context",
+            {
+                "session_id": session_a,
+                "title": "Launch decision",
+                "content": "The release date is June 12.",
+                "record_type": "decision",
+                "idempotency_key": "decision-codex",
+            },
+        )
+        document_id = structured_data(written)["document_id"]
+
+        async with app_b.router.lifespan_context(app_b), Client(
+            transport_for(app_b, claude_token)
+        ) as client_b:
+            registration_b = await client_b.call_tool(
+                "register_session",
+                {"label": "Decision reader", "idempotency_key": "register-claude"},
+            )
+            session_b = structured_data(registration_b)["session_id"]
+            found = await client_b.call_tool(
+                "search_context",
+                {
+                    "session_id": session_b,
+                    "query": "release date June",
+                    "mode": "keyword",
+                },
+            )
+            search_results = structured_data(found)["results"]
+            assert search_results[0]["document_id"] == document_id
+            assert search_results[0]["author_provider"] == "codex"
+
+            with pytest.raises(ToolError, match="Write access"):
+                await client_b.call_tool(
+                    "put_context",
+                    {
+                        "session_id": session_b,
+                        "document_id": document_id,
+                        "expected_revision": 1,
+                        "title": "Unauthorized",
+                        "content": "A different provider cannot update this.",
+                        "record_type": "decision",
+                        "idempotency_key": "unauthorized-update",
+                    },
+                )
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,9 @@ An authenticated MCP context server for sharing persistent context between agent
 The initial persistent-memory slice is implemented: authenticated logical sessions,
 revisioned text records, local embeddings, hybrid retrieval, typed task checkpoints, and
 bounded context assembly. The real embedding model has passed a local retrieval smoke test;
-the full client restart workflow still needs validation. Shared/project spaces, client-local
-recovery instructions, and production deployment are not implemented.
+an automated MCP client recovered local state across a real server-process restart.
+Client-specific integration still needs validation. Shared/project spaces and production
+deployment are not implemented.
 
 The user provisionally accepted Gate 0 for proceeding on 2026-11-16, with the
 client-compatibility gaps documented below; this is not approval for public exposure or
@@ -123,6 +124,8 @@ unresolved items, lessons, checkpoints, or handoffs. Writes use idempotency keys
 revision checks; retrieval supports keyword, semantic, or hybrid search, with hybrid as the
 default. Checkpoint heads are revisioned per logical session and task, and context assembly
 returns the exact checkpoint with bounded supporting evidence.
+See the [client session workflow](docs/client-workflow.md) for local state management,
+recovery, and checkpoint guidance.
 
 SQLite stores records, FTS5 indexes, and sqlite-vec vectors locally. The first memory write
 or semantic/hybrid search initializes FastEmbed and may download `BAAI/bge-small-en-v1.5`;
@@ -178,7 +181,7 @@ mapping. Revoking the GitHub OAuth app grant itself remains a separate action in
 
 ## Gate 0 status
 
-On macOS, all 56 automated tests pass, including the initial memory service, configuration,
+On macOS, all 61 automated tests pass, including the initial memory service, configuration,
 and MCP cross-provider workflow tests. A local server process has completed synthetic
 authenticated MCP round trips with Codex, Claude, and Copilot provider credentials.
 Missing/invalid credentials and unexpected Host/Origin headers were rejected. The real
